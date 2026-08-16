@@ -94,7 +94,16 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
             type="button"
             className="dsh-atb-btn"
             title="呼出侧边栏"
-            onClick={() => document.querySelector<HTMLElement>('[data-mobile-nav="toggle"]')?.click()}
+            onClick={() => {
+              document.querySelector<HTMLElement>('[data-mobile-nav="toggle"]')?.click()
+              // 兜底：mobile-nav 的 drawer 以 AppFrame 的 data-sidebar-collapsed 为准
+              // （无该属性 = drawer 展开）。原生 toggle 按钮可能不在 DOM，直接切属性保证生效。
+              const frame = document.querySelector<HTMLElement>('[data-mobile-nav="frame"]')
+              if (frame !== null) {
+                if (frame.hasAttribute('data-sidebar-collapsed')) frame.removeAttribute('data-sidebar-collapsed')
+                else frame.setAttribute('data-sidebar-collapsed', '')
+              }
+            }}
           >
             ☰ 侧边栏
           </button>

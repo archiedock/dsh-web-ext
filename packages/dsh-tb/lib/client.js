@@ -3004,7 +3004,12 @@ window.__ModuleLoader__.load({
 									type: "button",
 									className: "dsh-atb-btn",
 									title: "呼出侧边栏",
-									onClick: () => document.querySelector("[data-mobile-nav=\"toggle\"]")?.click(),
+									onClick: () => {
+										document.querySelector("[data-mobile-nav=\"toggle\"]")?.click();
+										const frame = document.querySelector("[data-mobile-nav=\"frame\"]");
+										if (frame !== null) if (frame.hasAttribute("data-sidebar-collapsed")) frame.removeAttribute("data-sidebar-collapsed");
+										else frame.setAttribute("data-sidebar-collapsed", "");
+									},
 									children: "☰ 侧边栏"
 								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 									type: "button",
