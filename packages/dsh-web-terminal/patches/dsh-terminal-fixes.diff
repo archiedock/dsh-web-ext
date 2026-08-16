@@ -1,29 +1,6 @@
---- node_modules/dsh-web-terminal/lib/index.js	1985-10-26 16:15:00.000000000 +0800
-+++ node_modules/dsh-web-terminal/lib/index.js	2026-08-16 19:18:27.484659691 +0800
-@@ -1119,7 +1119,8 @@
- var terminalWss = new WebSocketServer({ noServer: true });
- function isLoopbackRequest(request) {
-   const address = request.socket.remoteAddress;
--  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1") return false;
-+  // NOTE: patched for tailnet access — allow the tailscale peer address too.
-+  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1" && address !== "100.67.107.110") return false;
-   const host = request.headers.host;
-   if (typeof host !== "string") return false;
-   let hostUrl;
-@@ -1128,7 +1129,9 @@
-   } catch {
-     return false;
-   }
--  if (hostUrl.hostname !== "127.0.0.1" && hostUrl.hostname !== "localhost" && hostUrl.hostname !== "[::1]") return false;
-+  // NOTE: patched — trust the user's tailscale hostnames in addition to loopback.
-+  const TRUSTED_HOSTS = ["127.0.0.1", "localhost", "[::1]", "archie-pc.tailaeca49.ts.net", "100.67.107.110"];
-+  if (!TRUSTED_HOSTS.includes(hostUrl.hostname)) return false;
-   if (request.headers["sec-fetch-site"] === "cross-site") return false;
-   const origin = request.headers.origin;
-   if (origin === void 0) return true;
-
---- node_modules/dsh-web-terminal/lib/client.js	1985-10-26 16:15:00.000000000 +0800
-+++ node_modules/dsh-web-terminal/lib/client.js	2026-08-16 20:14:06.821052694 +0800
+diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-terminal/lib/client.js
+--- a/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:22:39.875562357 +0800
++++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:22:39.876467737 +0800
 @@ -9667,6 +9667,32 @@
      return this.props.children;
    }
@@ -99,7 +76,22 @@
        attrObserver.disconnect();
        window.removeEventListener("resize", fitNow);
        observer.disconnect();
-@@ -9973,7 +10006,11 @@
+@@ -9885,6 +9918,14 @@
+       ] })
+     ] }),
+     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "dshTermToolbar", children: [
++      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { className: "dshTermMobileNav", children: [
++        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "dshTermButton", title: "呼出侧边栏", onClick: () => {
++          document.querySelector('[data-mobile-nav="toggle"]')?.click();
++        }, children: "\u2630 \u4FA7\u8FB9\u680F" }),
++        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "dshTermButton", title: "返回会话", onClick: () => {
++          window.__dshTermController?.close();
++        }, children: "\u2715 \u8FD4\u56DE" })
++      ] }),
+       /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+         "button",
+         {
+@@ -9973,7 +10014,11 @@
  }
  var PANEL_CSS = `
  /* --- center-column takeover (global rules, attribute-scoped) ----------------- */
@@ -112,7 +104,21 @@
    position: relative;
  }
  
-@@ -10271,7 +10308,7 @@
+@@ -10176,6 +10221,13 @@
+   flex: none;
+   flex-wrap: wrap;
+ }
++/* NOTE: patched (dsh-web-ext) — mobile-only in-panel controls: the shell's
++   sidebar-toggle lives in the session header which the active rule hides on
++   narrow screens (same 1023px breakpoint as dsh-mobile-nav). */
++.dshTermMobileNav { display: none; }
++@media (max-width: 1023px) {
++  .dshTermMobileNav { display: inline-flex; gap: 6px; }
++}
+ 
+ .dshTermButton {
+   padding: 5px 12px;
+@@ -10271,7 +10323,7 @@
  
  // src/client/mount.tsx
  var import_jsx_runtime2 = require("react/jsx-runtime");
@@ -121,38 +127,37 @@
  var ACTIVE_ATTR = "data-dsh-terminal-active";
  var OTHER_ACTIVE_ATTRS = ["data-dsh-ssh-active", "data-dsh-taskboard-active"];
  var ACTIVATE_EVENT = "dsh-panel-activate";
-
---- node_modules/@dsh-external/dsh-mobile-nav/lib/client.js	2026-08-16 21:22:29.308208065 +0800
-+++ node_modules/@dsh-external/dsh-mobile-nav/lib/client.js	2026-08-16 19:50:05.948353906 +0800
-@@ -149,7 +149,7 @@
-             // would close and take the just-opened menu with it.
-             if (target.closest('[class*="sessionRow"] button') !== null)
-                 return;
--            const navigates = target.closest('button[data-dsh-taskboard-entry], button[data-dsh-ssh-entry], [class*="newSession"], [class*="sessionRow"], [class*="searchResultRow"], [class*="searchResultWorkspace"]');
-+            const navigates = target.closest('button[data-dsh-taskboard-entry], button[data-dsh-ssh-entry], button[data-dsh-terminal-entry], [class*="newSession"], [class*="sessionRow"], [class*="searchResultRow"], [class*="searchResultWorkspace"]');
-             if (navigates !== null)
-                 toggleSidebar();
-         };
-@@ -1066,11 +1066,13 @@
-     overflow-x: auto !important;
+@@ -10281,6 +10333,9 @@
+ }
+ function mountPanel(controller, api) {
+   ensureStyles();
++  // NOTE: patched (dsh-web-ext) — expose the panel controller so in-panel
++  // mobile controls (☰ sidebar / ✕ back) can close the terminal view.
++  window.__dshTermController = controller;
+   let root;
+   let container;
+   const ensure = () => {
+diff -ruN a/node_modules/dsh-web-terminal/lib/index.js b/node_modules/dsh-web-terminal/lib/index.js
+--- a/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:22:39.875689757 +0800
++++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:22:39.876577120 +0800
+@@ -1119,7 +1119,8 @@
+ var terminalWss = new WebSocketServer({ noServer: true });
+ function isLoopbackRequest(request) {
+   const address = request.socket.remoteAddress;
+-  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1") return false;
++  // NOTE: patched for tailnet access — allow the tailscale peer address too.
++  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1" && address !== "100.67.107.110") return false;
+   const host = request.headers.host;
+   if (typeof host !== "string") return false;
+   let hostUrl;
+@@ -1128,7 +1129,9 @@
+   } catch {
+     return false;
    }
-   /* The floating button must not float over a takeover panel (task board /
--     ssh own the center column while active). */
-+     ssh / terminal own the center column while active). */
-   html[data-dsh-taskboard-active] [data-mobile-nav="fab"],
-   html[data-dsh-ssh-active] [data-mobile-nav="fab"],
-+  html[data-dsh-terminal-active] [data-mobile-nav="fab"],
-   html[data-dsh-taskboard-active] [data-mobile-nav="backdrop"],
--  html[data-dsh-ssh-active] [data-mobile-nav="backdrop"] {
-+  html[data-dsh-ssh-active] [data-mobile-nav="backdrop"],
-+  html[data-dsh-terminal-active] [data-mobile-nav="backdrop"] {
-     display: none !important;
-   }
-   /* Board header: let the search field take the slack instead of squeezing
---- pnpm-workspace.yaml
-+++ pnpm-workspace.yaml
-@@ -8,2 +8,3 @@
- allowBuilds:
--  node-pty: set this to true or false
-+  node-pty: true
-+  esbuild: true
+-  if (hostUrl.hostname !== "127.0.0.1" && hostUrl.hostname !== "localhost" && hostUrl.hostname !== "[::1]") return false;
++  // NOTE: patched — trust the user's tailscale hostnames in addition to loopback.
++  const TRUSTED_HOSTS = ["127.0.0.1", "localhost", "[::1]", "archie-pc.tailaeca49.ts.net", "100.67.107.110"];
++  if (!TRUSTED_HOSTS.includes(hostUrl.hostname)) return false;
+   if (request.headers["sec-fetch-site"] === "cross-site") return false;
+   const origin = request.headers.origin;
+   if (origin === void 0) return true;
