@@ -22,7 +22,7 @@ import { createSessionJumper, type SessionsServiceFace, type WorkspacesServiceFa
 export const name = 'dsh-taskboard/client'
 
 /** Required client services (fiber inject waiting). */
-export const inject = ['connection']
+export const inject = ['connection', 'layout']
 
 /** Narrow connection face for the model catalog + preset roster. */
 interface ConnectionFace {
@@ -93,6 +93,14 @@ export function apply(ctx: ClientContextFace): void {
     }))
 
     controller.start()
+    // Mobile ☰ sidebar toggle: reuse the official shell layout service —
+    // mobile-nav's header button is exactly ctx.layout.toggleSidebar(), but
+    // the header (and its button) is hidden while the board is active, so
+    // expose the same call for the in-board button.
+    const layout = ctx.get?.('layout') as { toggleSidebar?(): void } | undefined
+    ;(window as unknown as { __dshAtbLayoutToggle?: () => void }).__dshAtbLayoutToggle = () => {
+      layout?.toggleSidebar?.()
+    }
     const disposers: Array<() => void> = []
     try {
       disposers.push(mountSidebarEntry(controller))

@@ -3005,10 +3005,7 @@ window.__ModuleLoader__.load({
 									className: "dsh-atb-btn",
 									title: "呼出侧边栏",
 									onClick: () => {
-										document.querySelector("[data-mobile-nav=\"toggle\"]")?.click();
-										const frame = document.querySelector("[data-mobile-nav=\"frame\"]");
-										if (frame !== null) if (frame.hasAttribute("data-sidebar-collapsed")) frame.removeAttribute("data-sidebar-collapsed");
-										else frame.setAttribute("data-sidebar-collapsed", "");
+										window.__dshAtbLayoutToggle?.();
 									},
 									children: "☰ 侧边栏"
 								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
@@ -3534,7 +3531,7 @@ window.__ModuleLoader__.load({
 		/** Client plugin name. */
 		const name = "dsh-taskboard/client";
 		/** Required client services (fiber inject waiting). */
-		const inject = ["connection"];
+		const inject = ["connection", "layout"];
 		/**
 		* Mount the client half.
 		* @param ctx - the client context (connection injected).
@@ -3577,6 +3574,10 @@ window.__ModuleLoader__.load({
 					getWorkspaces: () => ctx.get?.("workspaces")
 				}));
 				controller.start();
+				const layout = ctx.get?.("layout");
+				window.__dshAtbLayoutToggle = () => {
+					layout?.toggleSidebar?.();
+				};
 				const disposers = [];
 				try {
 					disposers.push(mountSidebarEntry(controller));

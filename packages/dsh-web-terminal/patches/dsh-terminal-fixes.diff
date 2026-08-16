@@ -1,6 +1,6 @@
 diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-terminal/lib/client.js
 --- a/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:22:39.875562357 +0800
-+++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:25:41.297567078 +0800
++++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:28:31.029974516 +0800
 @@ -9667,6 +9667,32 @@
      return this.props.children;
    }
@@ -76,18 +76,13 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
        attrObserver.disconnect();
        window.removeEventListener("resize", fitNow);
        observer.disconnect();
-@@ -9885,6 +9918,19 @@
+@@ -9885,6 +9918,14 @@
        ] })
      ] }),
      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "dshTermToolbar", children: [
 +      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { className: "dshTermMobileNav", children: [
 +        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "dshTermButton", title: "呼出侧边栏", onClick: () => {
-+          document.querySelector('[data-mobile-nav="toggle"]')?.click();
-+          const frame = document.querySelector('[data-mobile-nav="frame"]');
-+          if (frame !== null) {
-+            if (frame.hasAttribute('data-sidebar-collapsed')) frame.removeAttribute('data-sidebar-collapsed');
-+            else frame.setAttribute('data-sidebar-collapsed', '');
-+          }
++          window.__dshTermLayoutToggle?.();
 +        }, children: "\u2630 \u4FA7\u8FB9\u680F" }),
 +        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "dshTermButton", title: "返回会话", onClick: () => {
 +          window.__dshTermController?.close();
@@ -96,7 +91,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
          "button",
          {
-@@ -9973,7 +10019,11 @@
+@@ -9973,7 +10014,11 @@
  }
  var PANEL_CSS = `
  /* --- center-column takeover (global rules, attribute-scoped) ----------------- */
@@ -109,7 +104,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
    position: relative;
  }
  
-@@ -10176,6 +10226,13 @@
+@@ -10176,6 +10221,13 @@
    flex: none;
    flex-wrap: wrap;
  }
@@ -123,7 +118,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  
  .dshTermButton {
    padding: 5px 12px;
-@@ -10271,7 +10328,7 @@
+@@ -10271,7 +10323,7 @@
  
  // src/client/mount.tsx
  var import_jsx_runtime2 = require("react/jsx-runtime");
@@ -132,7 +127,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  var ACTIVE_ATTR = "data-dsh-terminal-active";
  var OTHER_ACTIVE_ATTRS = ["data-dsh-ssh-active", "data-dsh-taskboard-active"];
  var ACTIVATE_EVENT = "dsh-panel-activate";
-@@ -10281,6 +10338,9 @@
+@@ -10281,6 +10333,9 @@
  }
  function mountPanel(controller, api) {
    ensureStyles();
@@ -142,9 +137,35 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
    let root;
    let container;
    const ensure = () => {
+@@ -10440,7 +10495,7 @@
+ }
+ 
+ // src/client/index.ts
+-var inject = [];
++var inject = ['layout'];
+ function apply(ctx) {
+   const controller = new PanelController();
+   const api = new TerminalApi();
+@@ -10451,7 +10506,16 @@
+   } catch (error) {
+     console.warn("[dsh-terminal] mount failed:", error);
+   }
++  // NOTE: patched (dsh-web-ext) — expose the official shell layout toggle for
++  // the in-panel mobile ☰ button. ctx.layout is the same service the native
++  // header button uses (mobile-nav: onClick => ctx.layout.toggleSidebar());
++  // the header button itself may be hidden/absent while a panel is active.
++  window.__dshTermLayoutToggle = () => {
++    if (typeof ctx.layout?.toggleSidebar === "function") ctx.layout.toggleSidebar();
++    else ctx.get?.("layout")?.toggleSidebar?.();
++  };
+   ctx.effect(() => () => {
++    delete window.__dshTermLayoutToggle;
+     for (const dispose of disposers.splice(0)) dispose();
+   }, "dsh-terminal: ui mounts");
+ }
 diff -ruN a/node_modules/dsh-web-terminal/lib/index.js b/node_modules/dsh-web-terminal/lib/index.js
 --- a/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:22:39.875689757 +0800
-+++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:25:41.298186554 +0800
++++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:28:31.030451539 +0800
 @@ -1119,7 +1119,8 @@
  var terminalWss = new WebSocketServer({ noServer: true });
  function isLoopbackRequest(request) {
