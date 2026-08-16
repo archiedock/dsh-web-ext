@@ -89,6 +89,19 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
   return (
     <div className="dsh-atb-board">
       <div className="dsh-atb-toolbar">
+        <span className="dsh-atb-mobile-only dsh-atb-mobile-nav">
+          <button
+            type="button"
+            className="dsh-atb-btn"
+            title="呼出侧边栏"
+            onClick={() => document.querySelector<HTMLElement>('[data-mobile-nav="toggle"]')?.click()}
+          >
+            ☰ 侧边栏
+          </button>
+          <button type="button" className="dsh-atb-btn" title="返回会话" onClick={() => controller.closeBoard()}>
+            ✕ 返回
+          </button>
+        </span>
         <h2 className="dsh-atb-title">Agent 任务看板</h2>
         <span className="dsh-atb-count">{live.length} 任务 · rev {state.ledger.revision}</span>
         <button type="button" className="dsh-atb-btn" data-primary="true" onClick={() => controller.setComposer(true)}>

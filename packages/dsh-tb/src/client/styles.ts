@@ -48,6 +48,13 @@ export const STYLES = `
 }
 .dsh-atb-search { width: 130px; }
 .dsh-atb-badge[data-kind="stale"] { background: rgba(217,130,43,.15); color: #d9822b; }
+/* Mobile-only controls: the shell's own sidebar-toggle lives in the session
+   header, which the board-active rule hides on narrow screens (dsh-mobile-nav
+   uses the same 1023px breakpoint). Show in-board fallbacks there. */
+.dsh-atb-mobile-only { display: none; }
+@media (max-width: 1023px) {
+  .dsh-atb-mobile-nav { display: inline-flex; gap: 6px; }
+}
 
 html[data-dsh-atb-active] [data-pane="conversation"] > *:not([data-dsh-atb-view]),
 html[data-dsh-atb-active] [class*="centerCol"] > *:not([data-dsh-atb-view]) { display: none !important; }

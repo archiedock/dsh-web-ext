@@ -22,7 +22,12 @@ Web GUI 侧边栏「任务看板」入口点击没有任何反应（看板视图
 | 文件 | 修改 |
 |---|---|
 | `src/client/board-mount.tsx` | `CONVERSATION_COLUMN_SELECTOR` 增加 `[class*="centerCol"]` 兜底 |
-| `src/client/styles.ts` | 看板激活时隐藏会话内容的 CSS 规则，补充 `[class*="centerCol"]` 选择器分支 |
+| `src/client/styles.ts` | 看板激活时隐藏会话内容的 CSS 规则，补充 `[class*="centerCol"]` 选择器分支；新增 `.dsh-atb-mobile-only` 移动端专用控件样式（≤1023px 显示） |
+| `src/client/board/TaskBoard.tsx` | 看板 toolbar 新增移动端按钮：「☰ 侧边栏」（触发 `[data-mobile-nav="toggle"]`，呼出移动端侧边栏 drawer）与「✕ 返回」（关闭看板回到会话） |
+
+### 移动端修复说明
+
+看板激活时隐藏规则会隐藏会话列（centerCol）的直接子元素——其中包含移动端会话 header 里的侧边栏呼出按钮（`data-mobile-nav="toggle"`）；而 FAB 仅在 `[data-phase="active"]` 不存在时显示。因此手机端在看板内会失去呼出侧边栏的入口。修复：在看板 toolbar 提供移动端专属的呼出/返回按钮。
 
 `src/client/sidebar-entry.ts` 的侧边栏选择器 `[data-pane="sidebar"], [class*="sidebarCol"]` 本机可用（`sidebarCol` 存在），未改动。
 

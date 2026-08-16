@@ -776,6 +776,13 @@ window.__ModuleLoader__.load({
 		}
 		.dsh-atb-search { width: 130px; }
 		.dsh-atb-badge[data-kind="stale"] { background: rgba(217,130,43,.15); color: #d9822b; }
+		/* Mobile-only controls: the shell's own sidebar-toggle lives in the session
+		   header, which the board-active rule hides on narrow screens (dsh-mobile-nav
+		   uses the same 1023px breakpoint). Show in-board fallbacks there. */
+		.dsh-atb-mobile-only { display: none; }
+		@media (max-width: 1023px) {
+		  .dsh-atb-mobile-nav { display: inline-flex; gap: 6px; }
+		}
 
 		html[data-dsh-atb-active] [data-pane="conversation"] > *:not([data-dsh-atb-view]),
 		html[data-dsh-atb-active] [class*="centerCol"] > *:not([data-dsh-atb-view]) { display: none !important; }
@@ -2991,6 +2998,22 @@ window.__ModuleLoader__.load({
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: "dsh-atb-toolbar",
 						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "dsh-atb-mobile-only dsh-atb-mobile-nav",
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-btn",
+									title: "呼出侧边栏",
+									onClick: () => document.querySelector("[data-mobile-nav=\"toggle\"]")?.click(),
+									children: "☰ 侧边栏"
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-btn",
+									title: "返回会话",
+									onClick: () => controller.closeBoard(),
+									children: "✕ 返回"
+								})]
+							}),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
 								className: "dsh-atb-title",
 								children: "Agent 任务看板"
