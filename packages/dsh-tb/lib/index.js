@@ -1,0 +1,129 @@
+import { PROTOCOL_SECTION_NAME, TASKBOARD_PROTOCOL } from "./host/protocol-text.js";
+import { createGitFace } from "./host/git.js";
+import { dshHomePath } from "./host/sdk.js";
+import { ExecutionService } from "./host/execution.js";
+import { registerTaskboardRoutes } from "./host/routes.js";
+import { SchedulerService } from "./host/scheduler.js";
+import { TaskStore } from "./host/store.js";
+import { registerTaskboardTools, workspaceFace } from "./host/tools.js";
+//#region src/index.ts
+/** Ledger file name under the DSH home. */
+const LEDGER_FILE = "dsh-taskboard.json";
+/** Cordis plugin name. */
+const name = "dsh-taskboard";
+/** Required host services (tool registry + prompt assembly). */
+const inject = ["tools", "systemPrompt"];
+/**
+* Mount the host half.
+* @param ctx - the plugin context (tools + systemPrompt injected).
+*/
+function apply(ctx) {
+	const store = new TaskStore({ file: dshHomePath(LEDGER_FILE) });
+	const now = () => Date.now();
+	const maxConcurrent = Math.max(1, Number.parseInt(process.env.DSH_TASKBOARD_MAX_CONCURRENT ?? "", 10) || 3);
+	const disposeSection = ctx.systemPrompt.section({
+		name: PROTOCOL_SECTION_NAME,
+		order: 180,
+		text: TASKBOARD_PROTOCOL
+	});
+	ctx.effect(() => disposeSection, "dsh-taskboard: protocol section");
+	ctx.inject(["workspaceRegistry"], (wsCtx) => {
+		const disposers = [];
+		const modelProviders = () => {
+			try {
+				const llm = wsCtx.get("llm");
+				return llm === void 0 || typeof llm.listProviders !== "function" ? void 0 : llm.listProviders().map((p) => p.id);
+			} catch {
+				return;
+			}
+		};
+		disposers.push(...registerTaskboardTools(wsCtx, {
+			store,
+			workspaces: workspaceFace(wsCtx.workspaceRegistry),
+			now,
+			modelProviders
+		}));
+		const events = { onSessionEvent: (listener) => wsCtx.on("session/event", (session, event) => {
+			listener(session.id, event);
+		}) };
+		const git = createGitFace();
+		wsCtx.inject(["agents"], (agentCtx) => {
+			const execution = new ExecutionService({
+				store,
+				agents: { create: (options) => agentCtx.agents.create(options) },
+				workspaces: {
+					get: (id) => workspaceFace(wsCtx.workspaceRegistry).get(id),
+					attach: async (workspaceId, sessionId) => {
+						const ws = wsCtx.workspaceRegistry.get(workspaceId);
+						if (ws !== void 0) await ws.attachSession(sessionId);
+					}
+				},
+				events,
+				now,
+				git,
+				composeAgent: async (presetId) => {
+					const presets = agentCtx.get("agentPresets");
+					if (presets === void 0) return void 0;
+					const resolved = await presets.resolve(presetId);
+					return {
+						agentPreset: resolved.id,
+						setup: async (ctx) => {
+							await presets.mount(ctx, resolved.id);
+						}
+					};
+				},
+				renameSession: (sessionId, title) => {
+					try {
+						const sessions = agentCtx.get("sessions");
+						const sessionTitle = agentCtx.get("sessionTitle");
+						const session = sessions?.get(sessionId);
+						if (session !== void 0 && sessionTitle !== void 0) sessionTitle.rename(session, title);
+					} catch {}
+				},
+				defaultModel: () => {
+					try {
+						const selection = agentCtx.get("agentDefaultModel");
+						const read = selection?.currentSelection;
+						return read === void 0 ? void 0 : read.call(selection);
+					} catch {
+						return;
+					}
+				},
+				maxConcurrent
+			});
+			let disposeRoutes;
+			agentCtx.inject(["webServer"], (webCtx) => {
+				disposeRoutes = registerTaskboardRoutes(webCtx, {
+					store,
+					workspaces: workspaceFace(wsCtx.workspaceRegistry),
+					now,
+					run: (taskId, runOptions) => execution.run(taskId, "manual", runOptions),
+					cancel: (taskId) => execution.cancel(taskId),
+					modelProviders,
+					git
+				});
+				return () => disposeRoutes?.();
+			});
+			execution.reconcile();
+			const scheduler = new SchedulerService({
+				store,
+				execution,
+				now,
+				maxConcurrent
+			});
+			scheduler.start();
+			disposers.push(() => scheduler.dispose());
+			return () => {
+				disposeRoutes?.();
+				for (const dispose of disposers.splice(0)) dispose();
+			};
+		});
+		return () => {
+			for (const dispose of disposers.splice(0)) dispose();
+		};
+	});
+}
+//#endregion
+export { LEDGER_FILE, apply, inject, name };
+
+//# sourceMappingURL=index.js.map

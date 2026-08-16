@@ -1,0 +1,158 @@
+--- node_modules/dsh-web-terminal/lib/index.js	1985-10-26 16:15:00.000000000 +0800
++++ node_modules/dsh-web-terminal/lib/index.js	2026-08-16 19:18:27.484659691 +0800
+@@ -1119,7 +1119,8 @@
+ var terminalWss = new WebSocketServer({ noServer: true });
+ function isLoopbackRequest(request) {
+   const address = request.socket.remoteAddress;
+-  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1") return false;
++  // NOTE: patched for tailnet access — allow the tailscale peer address too.
++  if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1" && address !== "100.67.107.110") return false;
+   const host = request.headers.host;
+   if (typeof host !== "string") return false;
+   let hostUrl;
+@@ -1128,7 +1129,9 @@
+   } catch {
+     return false;
+   }
+-  if (hostUrl.hostname !== "127.0.0.1" && hostUrl.hostname !== "localhost" && hostUrl.hostname !== "[::1]") return false;
++  // NOTE: patched — trust the user's tailscale hostnames in addition to loopback.
++  const TRUSTED_HOSTS = ["127.0.0.1", "localhost", "[::1]", "archie-pc.tailaeca49.ts.net", "100.67.107.110"];
++  if (!TRUSTED_HOSTS.includes(hostUrl.hostname)) return false;
+   if (request.headers["sec-fetch-site"] === "cross-site") return false;
+   const origin = request.headers.origin;
+   if (origin === void 0) return true;
+
+--- node_modules/dsh-web-terminal/lib/client.js	1985-10-26 16:15:00.000000000 +0800
++++ node_modules/dsh-web-terminal/lib/client.js	2026-08-16 20:14:06.821052694 +0800
+@@ -9667,6 +9667,32 @@
+     return this.props.children;
+   }
+ };
++// NOTE: patched — xterm must not be opened in a zero-size container
++// (renderer creation fails there; the next Viewport refresh crashes reading
++// `.dimensions` off the undefined renderer => blank panel, e.g. when the
++// panel mounts while display:none or during a mobile slide-in). Defer
++// open+fit until the host has a real size; xterm's WriteBuffer buffers
++// writes that arrive before open. Fix mirrors the community fix in
++// dsh-better-sidebar (omdsh-dev/DSH-better-sidebar#25 / #27 / #42).
++function openWhenSized(host, open) {
++  let frame = null;
++  const step = () => {
++    frame = null;
++    if (!host.isConnected) return;
++    if (host.clientWidth > 0 && host.clientHeight > 0) {
++      open();
++      return;
++    }
++    frame = requestAnimationFrame(step);
++  };
++  frame = requestAnimationFrame(step);
++  return () => {
++    if (frame !== null) {
++      cancelAnimationFrame(frame);
++      frame = null;
++    }
++  };
++}
+ var TerminalView = (0, import_react.forwardRef)(function TerminalView2({ api, attempt, live, onStatus }, ref) {
+   const containerRef = (0, import_react.useRef)(null);
+   const wrapRef = (0, import_react.useRef)(null);
+@@ -9702,13 +9728,6 @@
+       });
+       fit = new o();
+       term.loadAddon(fit);
+-      term.open(container);
+-      requestAnimationFrame(() => {
+-        try {
+-          fit?.fit();
+-        } catch {
+-        }
+-      });
+       connection = api.openTerminal(term.cols, term.rows);
+       termRef.current = term;
+       fitRef.current = fit;
+@@ -9717,6 +9736,19 @@
+       onStatus({ kind: "error", detail: error instanceof Error ? error.message : String(error) });
+       return;
+     }
++    // NOTE: patched — open the terminal only once its container has a real
++    // size (zero-size open crashes xterm, leaving a blank panel; see the
++    // openWhenSized note above). The socket is created above regardless; the
++    // open callback sends the real cols/rows once fit has run.
++    const cancelOpen = openWhenSized(container, () => {
++      try {
++        term.open(container);
++        fit.fit();
++        connection?.resize(term.cols, term.rows);
++      } catch (error) {
++        onStatus({ kind: "error", detail: error instanceof Error ? error.message : String(error) });
++      }
++    });
+     onStatus({ kind: "connecting" });
+     let settled = false;
+     const dataSub = term.onData((data) => {
+@@ -9763,6 +9795,7 @@
+       });
+     }
+     return () => {
++      cancelOpen();
+       attrObserver.disconnect();
+       window.removeEventListener("resize", fitNow);
+       observer.disconnect();
+@@ -9973,7 +10006,11 @@
+ }
+ var PANEL_CSS = `
+ /* --- center-column takeover (global rules, attribute-scoped) ----------------- */
+-[data-pane='conversation'] {
++/* NOTE: patched — this GUI layout identifies the conversation column by the
++   centerCol class (no data-pane attribute); give it a positioning context so
++   the absolute inset-0 terminal panel sizes against it. */
++[data-pane='conversation'],
++[class*='centerCol'] {
+   position: relative;
+ }
+ 
+@@ -10271,7 +10308,7 @@
+ 
+ // src/client/mount.tsx
+ var import_jsx_runtime2 = require("react/jsx-runtime");
+-var CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"]';
++var CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"], [class*="centerCol"]';
+ var ACTIVE_ATTR = "data-dsh-terminal-active";
+ var OTHER_ACTIVE_ATTRS = ["data-dsh-ssh-active", "data-dsh-taskboard-active"];
+ var ACTIVATE_EVENT = "dsh-panel-activate";
+
+--- node_modules/@dsh-external/dsh-mobile-nav/lib/client.js	2026-08-16 21:22:29.308208065 +0800
++++ node_modules/@dsh-external/dsh-mobile-nav/lib/client.js	2026-08-16 19:50:05.948353906 +0800
+@@ -149,7 +149,7 @@
+             // would close and take the just-opened menu with it.
+             if (target.closest('[class*="sessionRow"] button') !== null)
+                 return;
+-            const navigates = target.closest('button[data-dsh-taskboard-entry], button[data-dsh-ssh-entry], [class*="newSession"], [class*="sessionRow"], [class*="searchResultRow"], [class*="searchResultWorkspace"]');
++            const navigates = target.closest('button[data-dsh-taskboard-entry], button[data-dsh-ssh-entry], button[data-dsh-terminal-entry], [class*="newSession"], [class*="sessionRow"], [class*="searchResultRow"], [class*="searchResultWorkspace"]');
+             if (navigates !== null)
+                 toggleSidebar();
+         };
+@@ -1066,11 +1066,13 @@
+     overflow-x: auto !important;
+   }
+   /* The floating button must not float over a takeover panel (task board /
+-     ssh own the center column while active). */
++     ssh / terminal own the center column while active). */
+   html[data-dsh-taskboard-active] [data-mobile-nav="fab"],
+   html[data-dsh-ssh-active] [data-mobile-nav="fab"],
++  html[data-dsh-terminal-active] [data-mobile-nav="fab"],
+   html[data-dsh-taskboard-active] [data-mobile-nav="backdrop"],
+-  html[data-dsh-ssh-active] [data-mobile-nav="backdrop"] {
++  html[data-dsh-ssh-active] [data-mobile-nav="backdrop"],
++  html[data-dsh-terminal-active] [data-mobile-nav="backdrop"] {
+     display: none !important;
+   }
+   /* Board header: let the search field take the slack instead of squeezing
+--- pnpm-workspace.yaml
++++ pnpm-workspace.yaml
+@@ -8,2 +8,3 @@
+ allowBuilds:
+-  node-pty: set this to true or false
++  node-pty: true
++  esbuild: true

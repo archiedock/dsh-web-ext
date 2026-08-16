@@ -1,0 +1,18 @@
+# NOTE: lib/ build output IS committed (prebuilt) so github: installs work
+# with no build step and no build-script approval — ecosystem convention.
+# Only the intermediate lib/client.cjs (already wrapped into client.js) stays local.
+lib/client.cjs
+
+# build scratch
+.tsc-check/
+
+# dependencies
+node_modules/
+
+# logs & misc
+*.log
+*.tmp
+.vitest-out*
+
+# local one-off scripts (screenshots, video scratch)
+_vlog.mjs
