@@ -1,6 +1,6 @@
 diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-terminal/lib/client.js
 --- a/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:22:39.875562357 +0800
-+++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:28:31.029974516 +0800
++++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:33:46.767651072 +0800
 @@ -9667,6 +9667,32 @@
      return this.props.children;
    }
@@ -104,6 +104,15 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
    position: relative;
  }
  
+@@ -9981,7 +10026,7 @@
+   position: absolute;
+   inset: 0;
+   display: none;
+-  z-index: 60;
++  z-index: 30;
+   background: var(--dsw-alias-bg-base);
+ }
+ 
 @@ -10176,6 +10221,13 @@
    flex: none;
    flex-wrap: wrap;
@@ -165,7 +174,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  }
 diff -ruN a/node_modules/dsh-web-terminal/lib/index.js b/node_modules/dsh-web-terminal/lib/index.js
 --- a/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:22:39.875689757 +0800
-+++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:28:31.030451539 +0800
++++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:33:46.768096757 +0800
 @@ -1119,7 +1119,8 @@
  var terminalWss = new WebSocketServer({ noServer: true });
  function isLoopbackRequest(request) {
