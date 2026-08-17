@@ -8,7 +8,8 @@
 dsh-web-ext/
 ├── packages/
 │   ├── dsh-tb/                # 修复版 dsh-taskboard（cloader/dsh-taskboard v0.3.3 + 本地补丁）
-│   └── dsh-web-terminal/      # dsh-web-terminal 本地修复（补丁 diff + 说明）
+│   ├── dsh-web-terminal/      # dsh-web-terminal 本地修复（补丁 diff + 说明）
+│   └── dsh-mobile-nav/        # 依赖包说明（@dsh-external/dsh-mobile-nav，未修改，仅记录来源与协作关系）
 └── scripts/                   # 安装/打补丁脚本（规划中）
 ```
 
@@ -16,8 +17,14 @@ dsh-web-ext/
 
 | 包 | 上游 | 版本 | 本地修改 |
 |---|---|---|---|
-| `dsh-tb` | [cloader/dsh-taskboard](https://github.com/cloader/dsh-taskboard) | 0.3.3 | 看板视图挂载兼容本机 shell（无 `data-pane` 属性，中心列为 `centerCol` class），详见 [packages/dsh-tb/PATCH.md](packages/dsh-tb/PATCH.md) |
-| `dsh-web-terminal` | [giiiiiithub/terminal](https://github.com/giiiiiithub/terminal) | 0.1.0 | ① tailnet 访问白名单（非 loopback 地址）② xterm 零尺寸容器延迟打开修复，详见 [packages/dsh-web-terminal/PATCH.md](packages/dsh-web-terminal/PATCH.md) |
+| `dsh-tb` | [cloader/dsh-taskboard](https://github.com/cloader/dsh-taskboard) | 0.3.3 | 看板视图挂载兼容本机 shell（无 `data-pane` 属性，中心列为 `centerCol` class）+ 移动端 ☰/✕ 按钮（layout 服务），详见 [packages/dsh-tb/PATCH.md](packages/dsh-tb/PATCH.md) |
+| `dsh-web-terminal` | [giiiiiithub/terminal](https://github.com/giiiiiithub/terminal) | 0.1.0 | ① tailnet 访问白名单 ② xterm 零尺寸延迟打开 ③ 移动端 ☰/✕ 按钮（layout 服务）④ 面板 z-index 60→30，详见 [packages/dsh-web-terminal/PATCH.md](packages/dsh-web-terminal/PATCH.md) |
+
+## 依赖包（未修改，原样使用）
+
+| 包 | 来源 | 版本 | 说明 |
+|---|---|---|---|
+| `dsh-mobile-nav` | [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile)（`github:` 源） | 0.2.0 | 移动端布局壳；`dsh-tb` / `dsh-web-terminal` 的 ☰ 按钮依赖其 `layout` 服务与 `data-sidebar-collapsed` 机制，详见 [packages/dsh-mobile-nav/README.md](packages/dsh-mobile-nav/README.md) |
 
 ## 安装方式
 
