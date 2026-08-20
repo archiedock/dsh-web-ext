@@ -14,6 +14,7 @@
 | `lib/client.js` | xterm 在零尺寸容器（`display:none` / 移动端滑入）中创建渲染器失败 → 面板空白，后续 Viewport 刷新崩溃 | 新增 `openWhenSized()`：延迟 `open+fit` 直到容器有真实尺寸；修复方案与社区 dsh-better-sidebar 修复一致 |
 | `lib/client.js` | 移动端：终端面板激活时隐藏会话列的规则（含 `centerCol` 兜底）会把移动端会话 header 里的侧边栏呼出按钮一并隐藏（FAB 又仅在无 active phase 时显示），手机端在终端内失去呼出侧边栏的入口 | 终端面板 toolbar 增加移动端专属按钮（≤1023px 显示）：「☰ 侧边栏」触发 `[data-mobile-nav="toggle"]` 呼出移动端 drawer、「✕ 返回」通过 `window.__dshTermController.close()` 关闭面板回到会话（`mountPanel` 暴露 controller 到 window） |
 | `lib/client.js` | 移动端 ☰ 呼出无效：① 原生 header toggle 按钮随 header 被面板激活规则隐藏，`.click()` 不可靠；② 直接切 `data-sidebar-collapsed` 与 layout 的 React 渲染竞态；③ 即使 drawer 滑出，终端面板 `z-index:60` 也盖住 drawer（`z-index:40`） | ① client 插件 `inject: ['layout']`，☰ 按钮改为调用官方 `ctx.layout.toggleSidebar()`（与 mobile-nav 原生按钮同源，经 `window.__dshTermLayoutToggle` 暴露）；② 终端面板 `[data-dsh-terminal-view]` 的 `z-index` 从 60 降到 **30**（低于 drawer 的 40），保证 drawer 可见 |
+| `lib/client.js` | 终端配色像 Ubuntu 默认色、面板不是黑色：① 本 build 的 DSH shell 不定义 `--dsw-alias-*` 主题变量（空值），面板 chrome（header/tab bar/toolbar/banner）回退成页面亮色（白底）；② xterm 主题背景是深海军蓝 `#0b0e14`，观感偏蓝紫，不是纯黑 | 整个终端面板钉死纯黑方案：`[data-dsh-terminal-view]` 及其子元素（面板/header/tabbar/toolbar/banner/placeholder/wrap）显式 `background:#000 !important`（不依赖缺失的主题变量），文字用浅色（标题白、次级灰），banner 绿/红、激活 tab 蓝色下划线保持可读；xterm 主题背景 `#0b0e14 → #000000` |
 
 ## 应用方式
 

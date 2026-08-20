@@ -1,6 +1,6 @@
 diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-terminal/lib/client.js
 --- a/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:22:39.875562357 +0800
-+++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-17 07:33:46.767651072 +0800
++++ b/node_modules/dsh-web-terminal/lib/client.js	2026-08-20 20:35:03.067166283 +0800
 @@ -9667,6 +9667,32 @@
      return this.props.children;
    }
@@ -34,7 +34,12 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  var TerminalView = (0, import_react.forwardRef)(function TerminalView2({ api, attempt, live, onStatus }, ref) {
    const containerRef = (0, import_react.useRef)(null);
    const wrapRef = (0, import_react.useRef)(null);
-@@ -9702,13 +9728,6 @@
+@@ -9698,17 +9724,10 @@
+         cursorBlink: true,
+         fontSize: 13,
+         fontFamily: 'Menlo, Consolas, "Liberation Mono", monospace',
+-        theme: { background: "#0b0e14", foreground: "#d8dee9", cursor: "#a3b8d0" }
++        theme: { background: "#000000", foreground: "#d8dee9", cursor: "#a3b8d0" }
        });
        fit = new o();
        term.loadAddon(fit);
@@ -104,16 +109,79 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
    position: relative;
  }
  
-@@ -9981,7 +10026,7 @@
+@@ -9981,8 +10026,69 @@
    position: absolute;
    inset: 0;
    display: none;
 -  z-index: 60;
+-  background: var(--dsw-alias-bg-base);
 +  z-index: 30;
-   background: var(--dsw-alias-bg-base);
++  background: var(--dsw-alias-bg-base, #000000);
++}
++
++/* NOTE: patched (dsh-web-ext) — the DSH shell does not define the --dsw-alias-*
++   theme variables in this build, so the panel chrome (header/tab bar/toolbar/
++   banner) fell back to the page's light background and the whole terminal
++   looked like a white panel around a dark navy box. Pin the entire terminal
++   panel to a pure-black scheme so it reads as a black terminal. */
++[data-dsh-terminal-view] {
++  background: #000000 !important;
++}
++[data-dsh-terminal-view] .dshTermPanel,
++[data-dsh-terminal-view] .dshTermHeader,
++[data-dsh-terminal-view] .dshTermTabBar,
++[data-dsh-terminal-view] .dshTermToolbar,
++[data-dsh-terminal-view] .dshTermBanner,
++[data-dsh-terminal-view] .dshTermPlaceholder {
++  background: #000000 !important;
++  border-color: #26262b !important;
++}
++[data-dsh-terminal-view] .dshTermTitle,
++[data-dsh-terminal-view] .dshTermTab[data-active],
++[data-dsh-terminal-view] .dshTermButton[data-kind='primary'] {
++  color: #ffffff !important;
++}
++[data-dsh-terminal-view] .dshTermMeta,
++[data-dsh-terminal-view] .dshTermTab,
++[data-dsh-terminal-view] .dshTermTabClose,
++[data-dsh-terminal-view] .dshTermBanner,
++[data-dsh-terminal-view] .dshTermPlaceholder {
++  color: #a6aab3 !important;
++}
++[data-dsh-terminal-view] .dshTermTab:hover,
++[data-dsh-terminal-view] .dshTermTabClose:hover {
++  color: #ffffff !important;
++  background: #1c1c22 !important;
++}
++[data-dsh-terminal-view] .dshTermTab[data-active] {
++  border-bottom-color: #4f6ef7 !important;
++}
++[data-dsh-terminal-view] .dshTermNewTab,
++[data-dsh-terminal-view] .dshTermButton {
++  background: #1c1c22 !important;
++  border-color: #33333b !important;
++  color: #d8dee9 !important;
++}
++[data-dsh-terminal-view] .dshTermNewTab:hover,
++[data-dsh-terminal-view] .dshTermButton:hover:not(:disabled) {
++  border-color: #4f6ef7 !important;
++  color: #ffffff !important;
++}
++[data-dsh-terminal-view] .dshTermBanner[data-kind='ok'] {
++  color: #22c55e !important;
++  border-color: #22c55e !important;
++}
++[data-dsh-terminal-view] .dshTermBanner[data-kind='error'] {
++  color: #ef4444 !important;
++  border-color: #ef4444 !important;
++}
++[data-dsh-terminal-view] .dshTermWrap {
++  background: #000000 !important;
++  border-color: #26262b !important;
  }
  
-@@ -10176,6 +10221,13 @@
+ html[data-dsh-terminal-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-dsh-terminal-view] {
+@@ -10176,6 +10282,13 @@
    flex: none;
    flex-wrap: wrap;
  }
@@ -127,7 +195,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  
  .dshTermButton {
    padding: 5px 12px;
-@@ -10271,7 +10323,7 @@
+@@ -10271,7 +10384,7 @@
  
  // src/client/mount.tsx
  var import_jsx_runtime2 = require("react/jsx-runtime");
@@ -136,7 +204,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  var ACTIVE_ATTR = "data-dsh-terminal-active";
  var OTHER_ACTIVE_ATTRS = ["data-dsh-ssh-active", "data-dsh-taskboard-active"];
  var ACTIVATE_EVENT = "dsh-panel-activate";
-@@ -10281,6 +10333,9 @@
+@@ -10281,6 +10394,9 @@
  }
  function mountPanel(controller, api) {
    ensureStyles();
@@ -146,7 +214,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
    let root;
    let container;
    const ensure = () => {
-@@ -10440,7 +10495,7 @@
+@@ -10440,7 +10556,7 @@
  }
  
  // src/client/index.ts
@@ -155,7 +223,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  function apply(ctx) {
    const controller = new PanelController();
    const api = new TerminalApi();
-@@ -10451,7 +10506,16 @@
+@@ -10451,7 +10567,16 @@
    } catch (error) {
      console.warn("[dsh-terminal] mount failed:", error);
    }
@@ -174,7 +242,7 @@ diff -ruN a/node_modules/dsh-web-terminal/lib/client.js b/node_modules/dsh-web-t
  }
 diff -ruN a/node_modules/dsh-web-terminal/lib/index.js b/node_modules/dsh-web-terminal/lib/index.js
 --- a/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:22:39.875689757 +0800
-+++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-17 07:33:46.768096757 +0800
++++ b/node_modules/dsh-web-terminal/lib/index.js	2026-08-20 20:35:03.070263606 +0800
 @@ -1119,7 +1119,8 @@
  var terminalWss = new WebSocketServer({ noServer: true });
  function isLoopbackRequest(request) {
