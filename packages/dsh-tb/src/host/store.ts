@@ -104,6 +104,19 @@ export class TaskStore {
   }
 
   /**
+   * Write a timestamped backup copy of the current ledger next to the live
+   * file (import-replace safety, 0.4.0). Never throws the caller's flow —
+   * a backup failure fails the import itself.
+   * @returns the backup file path.
+   */
+  async backup(): Promise<string> {
+    await this.load()
+    const target = `${this.file}.backup-${Date.now()}`
+    await persistAtomic(target, JSON.stringify(this.ledger, null, 2))
+    return target
+  }
+
+  /**
    * Run one mutation inside the serial queue. The mutator works on a
    * structured clone; returning `undefined` aborts with no write.
    * @param kind - change kind for subscribers.

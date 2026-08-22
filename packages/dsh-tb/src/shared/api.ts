@@ -56,6 +56,13 @@ export type CreateTaskBody = {
   isolation?: string
   /** Agent preset for execution sessions; omitted = deployment default. */
   presetId?: string
+  /** 准入 ID（选填；执行时随任务发给执行会话）。 */
+  admissionId?: string
+  /** 方案链接或路径（选填；执行时随任务发给执行会话）。 */
+  solutionRef?: string
+  /** Acceptance checklist item texts (host mints ids, all unchecked). */
+  checklist?: string[]
+
 }
 
 /** Update-task request body (ifVersion mandatory). */
@@ -74,6 +81,13 @@ export type UpdateTaskBody = {
   isolation?: string
   /** Change the execution preset (takes effect on the next run). */
   presetId?: string | null
+  /** 准入 ID；null 清除（选填）。 */
+  admissionId?: string | null
+  /** 方案链接或路径；null 清除（选填）。 */
+  solutionRef?: string | null
+  /** Replace the whole checklist (GUI owner surface); null clears it. */
+  checklist?: unknown
+
 }
 
 /** Move-task request body (ifVersion mandatory; the user MAY move to done). */
@@ -118,6 +132,56 @@ export type DiagnosticsResponse = {
   /** Git workspaces whose .gitignore does not ignore the worktree dir. */
   gitIgnoreSuggestions: GitignoreSuggestion[]
 }
+
+/** Fields a task template may prefill (0.4.0). */
+export type TaskTemplateSpec = {
+  title?: string
+  description?: string
+  prompt?: string
+  urgency?: string
+  execution?: { mode?: string; cron?: string }
+  model?: { provider: string; model: string }
+  isolation?: string
+  presetId?: string
+  /** Checklist item texts (host mints ids at create time). */
+  checklist?: string[]
+}
+
+/** One reusable task template (0.4.0). */
+export type TaskTemplate = {
+  id: string
+  name: string
+  task: TaskTemplateSpec
+  /** Seeded built-in templates (kept on load, deletable like any other). */
+  builtin?: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+/** Templates listing response. */
+export type TemplatesResponse = { templates: TaskTemplate[] }
+
+/** Import dry-run response (0.4.0): every task classified, nothing written. */
+export type ImportPreviewResponse = {
+  plan: {
+    create: Array<{ id: string; title: string; status: string }>
+    overwrite: Array<{ id: string; title: string; status: string }>
+    invalid: Array<{ id?: string; reason: string }>
+  }
+}
+
+/** Import commit response. */
+export type ImportCommitResponse = {
+  mode: 'merge' | 'replace'
+  created: number
+  overwritten: number
+  replacedTotal?: number
+  /** The backup file written BEFORE a replace wiped the live ledger. */
+  backupFile?: string
+}
+
+/** Diff-viewer response (0.4.0). */
+export type DiffResponse = { diff: string; truncated: boolean }
 
 /** One task (full record) response. */
 export type TaskResponse = TaskRecord

@@ -86,6 +86,15 @@ export function TaskCard({ task, controller, draggable = false, now, onAlert }: 
           <span className="dsh-atb-badge" data-kind="scheduled">⏰ {fmtTime(task.execution.nextRunAt)}</span>
         )}
         {task.model !== undefined && <span className="dsh-atb-badge">{task.model.model}</span>}
+        {task.checklist !== undefined && task.checklist.length > 0 && (
+          <span
+            className="dsh-atb-badge"
+            data-kind={task.status === 'in_review' && task.checklist.some(i => !i.checked) ? 'blocked' : 'checklist'}
+            title={task.status === 'in_review' && task.checklist.some(i => !i.checked) ? '待验收：清单未全部勾选' : '验收清单进度'}
+          >
+            ☑ {task.checklist.filter(i => i.checked).length}/{task.checklist.length}
+          </span>
+        )}
         {task.status === 'done' && <span className="dsh-atb-badge" data-kind="done">完成</span>}
         {last !== undefined && (
           <span className="dsh-atb-badge" data-kind={last.outcome === 'running' ? 'running' : last.outcome}>

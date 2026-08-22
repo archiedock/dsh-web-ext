@@ -7,10 +7,10 @@
  *
  * @module dsh-taskboard/client/board/TaskDetail
  */
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import type { BoardController } from '../controller.ts'
 import type { ExecutionRecord, TaskRecord } from '../../shared/protocol.ts'
-import { canTransition } from '../../shared/protocol.ts'
+import { canTransition, checklistProgress } from '../../shared/protocol.ts'
 import { useAlert } from './AlertModal.tsx'
 import { fmtTime, isStaleClaim } from './TaskBoard.tsx'
 
@@ -58,6 +58,145 @@ function shortHash(hash: string | undefined): string {
   return hash === undefined ? '' : hash.slice(0, 8)
 }
 
+/** Truncate a long string for a chip (full value in the tooltip). */
+function shorten(s: string, max = 40): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s
+}
+
+/** Whether a solution ref looks like a clickable http(s) URL. */
+function isUrl(ref: string): boolean {
+  try {
+    const u = new URL(ref)
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/** Extract the path from one `git status --porcelain` line (rename-aware). */
+function porcelainPath(line: string): string {
+  let p = line.slice(3)
+  const arrow = p.indexOf(' -> ')
+  if (arrow >= 0) p = p.slice(arrow + 4)
+  if (p.startsWith('"') && p.endsWith('"') && p.length > 1) p = p.slice(1, -1)
+  return p
+}
+
+/**
+ * Lazy diff viewer (0.4.0): loads on mount, renders inside a capped <pre>.
+ * @param spec - what to show: one commit hash, or one changed path.
+ */
+function DiffView({ controller, task, execution, commit, path }: {
+  controller: BoardController
+  task: TaskRecord
+  execution: ExecutionRecord
+  commit?: string
+  path?: string
+}) {
+  const [state, setState] = useState<{ loading: boolean; diff?: string; truncated?: boolean; failed?: boolean }>({ loading: true })
+  useEffect(() => {
+    let alive = true
+    setState({ loading: true })
+    void controller.fetchDiff(task.id, { execution: execution.id, ...(commit !== undefined ? { commit } : { path: path ?? '' }) }).then(result => {
+      if (!alive) return
+      if (result === undefined) setState({ loading: false, failed: true })
+      else setState({ loading: false, diff: result.diff, truncated: result.truncated })
+    })
+    return () => { alive = false }
+  }, [controller, task.id, execution.id, commit, path])
+  return (
+    <div className="dsh-atb-diffview">
+      <div className="dsh-atb-diffview-head">
+        <span className="dsh-atb-diffview-title">{commit !== undefined ? `提交 ${shortHash(commit)}` : `文件 ${path}`}</span>
+        {state.loading && <span className="dsh-atb-diffview-hint">读取中…</span>}
+        {state.truncated === true && <span className="dsh-atb-diffview-hint">⚠ 内容过长已截断</span>}
+      </div>
+      {state.failed === true
+        ? <div className="dsh-atb-diffview-error">获取失败（原因见看板顶部错误条；对象可能已随 worktree 删除丢失）</div>
+        : <pre className="dsh-atb-diffview-pre">{state.diff ?? ''}</pre>}
+    </div>
+  )
+}
+
+/**
+ * The DoD checklist block (0.4.0): user-togglable items, checker + evidence
+ * per row; unchecked items highlight while the task sits in in_review.
+ */
+function ChecklistBlock({ task, controller }: { task: TaskRecord; controller: BoardController }) {
+  const items = task.checklist ?? []
+  if (items.length === 0) return null
+  const { done, total } = checklistProgress(task)
+  const unchecked = total - done
+  const reviewing = task.status === 'in_review'
+  return (
+    <div className="dsh-atb-fieldcard" data-kind="checklist">
+      <div className="dsh-atb-fieldcard-label">
+        验收清单（DoD）
+        <span className="dsh-atb-cl-progress" data-tone={reviewing && unchecked > 0 ? 'bad' : undefined}>
+          ☑ {done}/{total}{reviewing && unchecked > 0 ? ` · ${unchecked} 项未完成` : done === total ? ' · 全部完成' : ''}
+        </span>
+      </div>
+      <div className="dsh-atb-cl-items">
+        {items.map(item => (
+          <label
+            key={item.id}
+            className="dsh-atb-cl-item"
+            data-checked={item.checked ? 'true' : undefined}
+            data-alert={reviewing && !item.checked ? 'true' : undefined}
+          >
+            <input
+              type="checkbox"
+              checked={item.checked}
+              onChange={() => void controller.toggleChecklistItem(task, item.id)}
+            />
+            <span className="dsh-atb-cl-text">{item.text}</span>
+            <span className="dsh-atb-cl-meta">
+              {item.checked
+                ? `${item.checkedBy === 'user' ? '👤 用户' : `🤖 ${shortId(item.checkedBy)}`} · ${fmtTime(item.checkedAt)}`
+                : '未完成'}
+              {item.note !== undefined && item.note.length > 0 && <span className="dsh-atb-cl-note" title={item.note}>证据：{item.note}</span>}
+            </span>
+          </label>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The structured execution report block (0.4.0): the newest execution that
+ * carries one, rendered section by section for the reviewer.
+ */
+function ReportBlock({ task }: { task: TaskRecord }) {
+  const execution = [...task.executions].reverse().find(e => e.report !== undefined)
+  const report = execution?.report
+  if (execution === undefined || report === undefined) return null
+  const section = (label: string, rows: string[] | undefined): ReactNode => rows !== undefined && rows.length > 0
+    ? (
+        <div className="dsh-atb-rpt-sec">
+          <div className="dsh-atb-rpt-label">{label}</div>
+          <ul className="dsh-atb-rpt-list">{rows.map((row, i) => <li key={i}>{row}</li>)}</ul>
+        </div>
+      )
+    : null
+  return (
+    <div className="dsh-atb-fieldcard" data-kind="report">
+      <div className="dsh-atb-fieldcard-label">执行报告<span className="dsh-atb-cl-progress">由执行会话提交 · {fmtTime(execution.endedAt ?? execution.startedAt)}</span></div>
+      <div className="dsh-atb-rpt-summary">{report.summary}</div>
+      {section('改动文件', report.changedFiles)}
+      {section('自验情况', report.checks)}
+      {section('产物', report.artifacts)}
+      {report.risk.length > 0 && (
+        <div className="dsh-atb-rpt-sec">
+          <div className="dsh-atb-rpt-label">剩余风险</div>
+          <div className="dsh-atb-rpt-risk">{report.risk}</div>
+        </div>
+      )}
+    </div>
+  )
+
+}
+
 /**
  * The 0.3.0 isolation block: branch / baseline→head commits / change stats /
  * uncommitted-changes warning, plus the user-only git actions (merge /
@@ -68,6 +207,9 @@ function IsolationBlock({ task, controller }: { task: TaskRecord; controller: Bo
   const [confirmMerge, setConfirmMerge] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState<'wt' | 'wtb' | null>(null)
   const [busy, setBusy] = useState(false)
+  // Diff viewer (0.4.0): which commit / changed path is expanded.
+  const [openDiff, setOpenDiff] = useState<{ commit?: string; path?: string } | null>(null)
+  const [dirtyOpen, setDirtyOpen] = useState(false)
   const execution = latestIsolated(task)
   const running = task.executions.some(e => e.outcome === 'running')
   if (execution === undefined) return null
@@ -124,9 +266,19 @@ function IsolationBlock({ task, controller }: { task: TaskRecord; controller: Bo
         ? (
             <div className="dsh-atb-iso-commits">
               {commits.slice(0, 10).map(c => (
-                <div key={c.hash} className="dsh-atb-iso-commit">
-                  <code>{shortHash(c.hash)}</code>
-                  <span>{c.subject}</span>
+                <div key={c.hash} className="dsh-atb-iso-commit" data-open={openDiff?.commit === c.hash ? 'true' : undefined}>
+                  <button
+                    type="button"
+                    className="dsh-atb-iso-commit-btn"
+                    title="点击展开该提交的 diff"
+                    onClick={() => setOpenDiff(openDiff?.commit === c.hash ? null : { commit: c.hash })}
+                  >
+                    <code>{shortHash(c.hash)}</code>
+                    <span>{c.subject}</span>
+                  </button>
+                  {openDiff?.commit === c.hash && (
+                    <DiffView controller={controller} task={task} execution={execution} commit={c.hash} />
+                  )}
                 </div>
               ))}
               {commitTotal > 10 && <div className="dsh-atb-iso-more">… 共 {commitTotal} 个提交</div>}
@@ -135,8 +287,32 @@ function IsolationBlock({ task, controller }: { task: TaskRecord; controller: Bo
         : <div className="dsh-atb-iso-nocommit">该次执行没有产生提交（改动可能未提交，见下方警告）</div>}
 
       {dirtyTotal > 0 && (
-        <div className="dsh-atb-iso-dirty" title={dirty.join('\n')}>
-          ⚠ 有 {dirtyTotal} 处未提交修改（合并前请让 agent 提交，或手动处理）
+        <div className="dsh-atb-iso-dirty">
+          <button type="button" className="dsh-atb-iso-dirty-toggle" onClick={() => setDirtyOpen(!dirtyOpen)}>
+            ⚠ 有 {dirtyTotal} 处未提交修改（合并前请让 agent 提交，或手动处理）{dirtyOpen ? ' ▲' : ' ▼ 查看文件'}
+          </button>
+          {dirtyOpen && (
+            <div className="dsh-atb-iso-dirty-files">
+              {dirty.slice(0, 30).map((line, index) => {
+                const filePath = porcelainPath(line)
+                return (
+                  <button
+                    key={`${line}-${index}`}
+                    type="button"
+                    className="dsh-atb-iso-dirty-file"
+                    title="点击查看该文件的未提交 diff"
+                    onClick={() => setOpenDiff(openDiff?.path === filePath ? null : { path: filePath })}
+                  >
+                    <code>{line.slice(0, 2)}</code> {filePath}
+                  </button>
+                )
+              })}
+              {dirtyTotal > 30 && <div className="dsh-atb-iso-more">… 共 {dirtyTotal} 处（完整列表见任务台账）</div>}
+            </div>
+          )}
+          {openDiff?.path !== undefined && dirtyOpen && (
+            <DiffView controller={controller} task={task} execution={execution} path={openDiff.path} />
+          )}
         </div>
       )}
 
@@ -220,6 +396,7 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
   const runningExecution = task.executions.find(e => e.outcome === 'running')
   const holder = task.status === 'in_progress' ? task.claimedBy : undefined
   const stale = now !== undefined && isStaleClaim(task, now)
+  const unchecked = (task.checklist ?? []).filter(i => !i.checked).length
 
   /** Jump to an execution's session; prompt precisely when it cannot open. */
   const jumpToSession = (sessionId: string): void => {
@@ -243,10 +420,27 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
             <Chip icon="📁">{ws?.title ?? shortId(task.workspaceId)}</Chip>
             {task.model !== undefined && <Chip icon="✦">{task.model.model}</Chip>}
             {task.presetId !== undefined && <Chip icon="🎛" >{task.presetId}</Chip>}
+            {task.admissionId !== undefined && (
+              <Chip icon="🪪">
+                <span title={task.admissionId}>准入 {shorten(task.admissionId)}</span>
+              </Chip>
+            )}
+            {task.solutionRef !== undefined && (
+              <Chip icon="🔗">
+                {isUrl(task.solutionRef)
+                  ? <a href={task.solutionRef} target="_blank" rel="noreferrer" title={task.solutionRef}>{shorten(task.solutionRef)}</a>
+                  : <span title={task.solutionRef}>{shorten(task.solutionRef)}</span>}
+              </Chip>
+            )}
             {task.execution.mode === 'scheduled' && (
               <Chip icon="⏰">{task.execution.cron} · 下次 {fmtTime(task.execution.nextRunAt)}</Chip>
             )}
             {task.blocked && <Chip icon="⛔" tone="urgent">受阻</Chip>}
+            {task.checklist !== undefined && task.checklist.length > 0 && (
+              <Chip icon="☑" tone={task.status === 'in_review' && task.checklist.some(i => !i.checked) ? 'urgent' : undefined}>
+                清单 {checklistProgress(task).done}/{task.checklist.length}
+              </Chip>
+            )}
             {task.branch !== undefined && (
               <Chip icon="🌿" tone={undefined}>Worktree · {task.branch.length > 28 ? `${task.branch.slice(0, 28)}…` : task.branch}</Chip>
             )}
@@ -272,6 +466,18 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
             onClick={() => void controller.duplicate(task)}
           >
             ⧉ 复制
+          </button>
+          <button
+            type="button"
+            className="dsh-atb-detail-edit"
+            title="把此任务的配置（含清单）保存为模板，新建任务时可用"
+            onClick={() => {
+              void controller.saveAsTemplate(task).then(ok => {
+                if (ok) showAlert('已存为模板（新建任务 ▼ 下拉可用，可在模板管理中改名）')
+              })
+            }}
+          >
+            ⌗ 存为模板
           </button>
           {canRun && task.branch !== undefined && (
             <button
@@ -332,13 +538,19 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
 
       <IsolationBlock task={task} controller={controller} />
 
+      <ReportBlock task={task} />
+
+      <ChecklistBlock task={task} controller={controller} />
+
       <div className="dsh-atb-detail-actions">
         <div className="dsh-atb-movebtns">
           {moveTargets(task).map(to => to === 'done'
             ? (confirmDone
                 ? (
                     <span key={to} className="dsh-atb-confirm">
-                      <span className="dsh-atb-confirm-label">确认完成？</span>
+                      <span className="dsh-atb-confirm-label" data-tone={unchecked > 0 ? 'bad' : undefined}>
+                        {unchecked > 0 ? `仍有 ${unchecked} 项清单未勾选，确认完成？` : '确认完成？'}
+                      </span>
                       <button type="button" className="dsh-atb-btn" data-primary="true" onClick={() => { void controller.move(task.id, task.version, 'done'); setConfirmDone(false) }}>确认</button>
                       <button type="button" className="dsh-atb-btn" onClick={() => setConfirmDone(false)}>取消</button>
                     </span>

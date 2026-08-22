@@ -5,10 +5,13 @@ import { ExecutionService } from "./host/execution.js";
 import { registerTaskboardRoutes } from "./host/routes.js";
 import { SchedulerService } from "./host/scheduler.js";
 import { TaskStore } from "./host/store.js";
+import { TemplateStore } from "./host/templates.js";
 import { registerTaskboardTools, workspaceFace } from "./host/tools.js";
 //#region src/index.ts
 /** Ledger file name under the DSH home. */
 const LEDGER_FILE = "dsh-taskboard.json";
+/** Task-template side file name under the DSH home (0.4.0). */
+const TEMPLATES_FILE = "dsh-taskboard-templates.json";
 /** Cordis plugin name. */
 const name = "dsh-taskboard";
 /** Required host services (tool registry + prompt assembly). */
@@ -19,6 +22,7 @@ const inject = ["tools", "systemPrompt"];
 */
 function apply(ctx) {
 	const store = new TaskStore({ file: dshHomePath(LEDGER_FILE) });
+	const templates = new TemplateStore(dshHomePath(TEMPLATES_FILE));
 	const now = () => Date.now();
 	const maxConcurrent = Math.max(1, Number.parseInt(process.env.DSH_TASKBOARD_MAX_CONCURRENT ?? "", 10) || 3);
 	const disposeSection = ctx.systemPrompt.section({
@@ -100,7 +104,8 @@ function apply(ctx) {
 					run: (taskId, runOptions) => execution.run(taskId, "manual", runOptions),
 					cancel: (taskId) => execution.cancel(taskId),
 					modelProviders,
-					git
+					git,
+					templates
 				});
 				return () => disposeRoutes?.();
 			});
@@ -124,6 +129,6 @@ function apply(ctx) {
 	});
 }
 //#endregion
-export { LEDGER_FILE, apply, inject, name };
+export { LEDGER_FILE, TEMPLATES_FILE, apply, inject, name };
 
 //# sourceMappingURL=index.js.map

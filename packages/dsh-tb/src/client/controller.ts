@@ -7,8 +7,8 @@
  *
  * @module dsh-taskboard/client/controller
  */
-import type { ChangeEvent, DiagnosticsResponse, UpdateTaskBody, WorkspaceView } from '../shared/api.ts'
-import type { IsolationMode, TaskLedger, TaskRecord, Urgency } from '../shared/protocol.ts'
+import type { ChangeEvent, DiagnosticsResponse, DiffResponse, ImportCommitResponse, ImportPreviewResponse, TaskTemplate, TaskTemplateSpec, UpdateTaskBody, WorkspaceView } from '../shared/api.ts'
+import type { ChecklistItem, IsolationMode, TaskLedger, TaskRecord, Urgency } from '../shared/protocol.ts'
 import { emptyLedger } from '../shared/protocol.ts'
 import type { TaskboardClient } from './api.ts'
 import type { SessionJumpResult } from './session-jump.ts'
@@ -86,6 +86,14 @@ export interface ControllerState {
   diagOpen: boolean
   /** Last fetched diagnostics payload (⚙ panel). */
   diagnostics?: DiagnosticsResponse
+  /** Task templates (0.4.0), lazy-loaded when the new-task menu opens. */
+  templates: TaskTemplate[]
+  /** Template manager modal visible. */
+  tplManagerOpen: boolean
+  /** Import modal visible (0.4.0). */
+  importOpen: boolean
+  /** Fields a chosen template prefills into the create form (consumed on open). */
+  templatePrefill?: TaskTemplateSpec
   /** Transient error surface (action failures); cleared on next success. */
   error?: string
 }
@@ -103,6 +111,9 @@ function initialState(): ControllerState {
     composerOpen: false,
     secondaryOpen: false,
     diagOpen: false,
+    templates: [],
+    tplManagerOpen: false,
+    importOpen: false,
   }
 }
 
@@ -234,14 +245,19 @@ export class BoardController {
   /** Select a task (open detail). */
   select(id?: string): void { this.setState({ selectedId: id }) }
 
-  /** Show/hide the task form (create mode when opening). */
-  setComposer(open: boolean): void { this.setState({ composerOpen: open, editingId: undefined }) }
+  /** Show/hide the task form (create mode when opening); always blank (no template prefill). */
+  setComposer(open: boolean): void { this.setState({ composerOpen: open, editingId: undefined, templatePrefill: undefined }) }
 
-  /** Open the form modal editing an existing task. */
-  openEditor(id: string): void { this.setState({ composerOpen: true, editingId: id }) }
+  /** Open the create form prefilled from a chosen template (0.4.0). */
+  newFromTemplate(spec: TaskTemplateSpec): void {
+    this.setState({ composerOpen: true, editingId: undefined, templatePrefill: spec })
+  }
+
+  /** Open the form modal editing an existing task (clears any template prefill). */
+  openEditor(id: string): void { this.setState({ composerOpen: true, editingId: id, templatePrefill: undefined }) }
 
   /** Close the form modal whatever its mode. */
-  closeForm(): void { this.setState({ composerOpen: false, editingId: undefined }) }
+  closeForm(): void { this.setState({ composerOpen: false, editingId: undefined, templatePrefill: undefined }) }
 
   /** Toggle the secondary tab. */
   toggleSecondary(): void { this.setState({ secondaryOpen: !this.state.secondaryOpen }) }
@@ -346,6 +362,34 @@ export class BoardController {
     }
   }
 
+  /**
+   * Toggle one checklist item as the USER (0.4.0): flips the item, records
+   * `checkedBy: 'user'`, keeps other items as they are (one update call).
+   */
+  async toggleChecklistItem(task: TaskRecord, itemId: string): Promise<void> {
+    const items: ChecklistItem[] = (task.checklist ?? []).map(item => item.id === itemId
+      ? (item.checked
+          ? { id: item.id, text: item.text, checked: false }
+          : { id: item.id, text: item.text, checked: true, checkedBy: 'user', checkedAt: Date.now(), ...(item.note !== undefined ? { note: item.note } : {}) })
+      : item)
+    try {
+      await this.client.update(task.id, { ifVersion: task.version, checklist: items })
+      await this.refresh()
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /** Diff view (0.4.0): one execution's commit or changed path; errors surface via throw. */
+  async fetchDiff(taskId: string, query: { execution: string; commit?: string; path?: string }): Promise<DiffResponse | undefined> {
+    try {
+      return await this.client.diff(taskId, query)
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return undefined
+    }
+  }
+
   /** Append a user comment. */
   async comment(id: string, body: string): Promise<void> {
     try {
@@ -437,7 +481,7 @@ export class BoardController {
     }
   }
 
-  /** Duplicate a task into a fresh todo card (same project/urgency/prompt/execution/model/isolation). */
+  /** Duplicate a task into a fresh todo card (same project/urgency/prompt/execution/model/isolation/checklist). */
   async duplicate(task: TaskRecord): Promise<void> {
     try {
       await this.client.create({
@@ -452,10 +496,113 @@ export class BoardController {
         model: task.model,
         isolation: task.isolation,
         ...(task.presetId !== undefined ? { presetId: task.presetId } : {}),
+        ...(task.admissionId !== undefined ? { admissionId: task.admissionId } : {}),
+        ...(task.solutionRef !== undefined ? { solutionRef: task.solutionRef } : {}),
+        ...(task.checklist !== undefined && task.checklist.length > 0 ? { checklist: task.checklist.map(i => i.text) } : {}),
+
       })
       await this.refresh()
     } catch (error) {
       this.setState({ error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  // ------------------------------------------------ templates (0.4.0)
+  /** Load the template list (best effort; errors surface). */
+  async loadTemplates(): Promise<TaskTemplate[]> {
+    try {
+      const value = await this.client.templates()
+      this.setState({ templates: value.templates, error: undefined })
+      return value.templates
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return []
+    }
+  }
+
+  /** Open the + 新建任务 dropdown's template list fresh (called on menu open). */
+  prepareTemplateMenu(): void {
+    if (this.state.templates.length === 0) void this.loadTemplates()
+  }
+
+  /** Open the template manager modal. */
+  openTemplateManager(): void {
+    this.setState({ tplManagerOpen: true })
+    void this.loadTemplates()
+  }
+
+  /** Close the template manager modal. */
+  closeTemplateManager(): void { this.setState({ tplManagerOpen: false }) }
+
+  /** Create or replace a template; refreshes the list. */
+  async upsertTemplate(body: { id?: string; name: string; task: TaskTemplateSpec }): Promise<boolean> {
+    try {
+      await this.client.templateUpsert(body)
+      await this.loadTemplates()
+      return true
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return false
+    }
+  }
+
+  /** Delete a template by id; refreshes the list. */
+  async deleteTemplate(id: string): Promise<void> {
+    try {
+      await this.client.templateDelete(id)
+      await this.loadTemplates()
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /** 存为模板 from a task card: carries every configurable field incl. checklist texts. */
+  async saveAsTemplate(task: TaskRecord): Promise<boolean> {
+    return this.upsertTemplate({
+      name: task.title.slice(0, 60),
+      task: {
+        title: task.title,
+        description: task.description.length > 0 ? task.description : undefined,
+        prompt: task.prompt.length > 0 ? task.prompt : undefined,
+        urgency: task.urgency,
+        execution: task.execution.mode === 'scheduled' && task.execution.cron !== undefined
+          ? { mode: 'scheduled', cron: task.execution.cron }
+          : { mode: 'claim' },
+        model: task.model,
+        isolation: task.isolation,
+        ...(task.presetId !== undefined ? { presetId: task.presetId } : {}),
+        ...(task.checklist !== undefined && task.checklist.length > 0 ? { checklist: task.checklist.map(i => i.text) } : {}),
+      },
+    })
+  }
+
+  // ------------------------------------------------ import (0.4.0)
+  /** Open the import modal. */
+  openImport(): void { this.setState({ importOpen: true }) }
+
+  /** Close the import modal. */
+  closeImport(): void { this.setState({ importOpen: false }) }
+
+  /** Dry-run an import file: classify its tasks against the live ledger. */
+  async importPreview(file: unknown): Promise<ImportPreviewResponse['plan'] | undefined> {
+    try {
+      const value = await this.client.importPreview(file)
+      return value.plan
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return undefined
+    }
+  }
+
+  /** Commit an import; refreshes the ledger afterwards. */
+  async importCommit(mode: 'merge' | 'replace', ledger: unknown): Promise<ImportCommitResponse | undefined> {
+    try {
+      const value = await this.client.importCommit(mode, ledger)
+      await this.refresh()
+      return value
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return undefined
     }
   }
 

@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { registerTaskboardRoutes } from '../src/host/routes.ts'
 import { TaskStore } from '../src/host/store.ts'
+import { TemplateStore } from '../src/host/templates.ts'
 import type { GitFace } from '../src/host/git.ts'
 import type { WorkspaceFace } from '../src/host/tools.ts'
 
@@ -18,6 +19,7 @@ let server: Server
 let base: string
 let disposeRoutes: () => void
 let store: InstanceType<typeof TaskStore>
+let templates: InstanceType<typeof TemplateStore>
 let cancelCalls: string[]
 let runCalls: Array<{ id: string; runOptions?: { reuseWorktree?: boolean } }>
 let dir: string
@@ -44,6 +46,12 @@ const gitBehavior = {
   merged: [] as Array<{ root: string; branch: string }>,
   removed: [] as string[],
   deletedBranches: [] as string[],
+  /** Diff viewer: commit hash → patch text (undefined = fail-soft miss). */
+  showCommit: undefined as string | undefined,
+  /** Diff viewer: path → patch text (undefined = fail-soft miss). */
+  showPath: undefined as string | undefined,
+  showCommitCalls: [] as Array<{ cwd: string; hash: string }>,
+  showPathCalls: [] as Array<{ cwd: string; path: string; base?: string }>,
 }
 const gitFace: GitFace = {
   detect: root => gitBehavior.detect(root),
@@ -64,12 +72,21 @@ const gitFace: GitFace = {
     gitBehavior.deletedBranches.push(branch)
     if (gitBehavior.branchDeleteError !== undefined) throw new Error(gitBehavior.branchDeleteError)
   },
+  showCommit: async (cwd, hash) => {
+    gitBehavior.showCommitCalls.push({ cwd, hash })
+    return gitBehavior.showCommit === undefined ? undefined : { text: gitBehavior.showCommit, truncated: false }
+  },
+  showPathDiff: async (cwd, path, base) => {
+    gitBehavior.showPathCalls.push({ cwd, path, base })
+    return gitBehavior.showPath === undefined ? undefined : { text: gitBehavior.showPath, truncated: false }
+  },
 }
 
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'tb-routes-'))
   server = createServer()
   store = new TaskStore({ file: join(dir, 'ledger.json') })
+  templates = new TemplateStore(join(dir, 'templates.json'))
   cancelCalls = []
   runCalls = []
   const routes: Array<{ kind: string; path: string; handler: (req: never, res: never) => void }> = []
@@ -89,6 +106,7 @@ beforeAll(async () => {
     cancel: async id => { cancelCalls.push(id); return { ok: true, executionId: 'e-x' } },
     modelProviders: () => ['prov-a'],
     git: gitFace,
+    templates,
   })
   server.on('request', (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
@@ -373,6 +391,47 @@ describe('taskboard routes', () => {
     expect(fullA4.value.presetId).toBeUndefined()
   })
 
+  it('admissionId/solutionRef: create stores them (trimmed), update rewrites and null clears', async () => {
+    // Create with both optional fields; whitespace is trimmed, blanks omitted.
+    const a = await post('/dsh-taskboard/tasks', {
+      title: 'Ref task', workspaceId: 'ws-a', urgency: 'normal',
+      admissionId: '  ADM-2024-001  ', solutionRef: '  /docs/plan.md  ',
+    })
+    expect(a.status).toBe(201)
+    const id = a.json.value.id as string
+    let full = await (await fetch(`${base}/dsh-taskboard/tasks/${id}`)).json()
+    expect(full.value.admissionId).toBe('ADM-2024-001')
+    expect(full.value.solutionRef).toBe('/docs/plan.md')
+
+    const b = await post('/dsh-taskboard/tasks', { title: 'Ref blank', workspaceId: 'ws-a', urgency: 'normal', admissionId: '   ', solutionRef: '' })
+    const idB = b.json.value.id as string
+    const fullB = await (await fetch(`${base}/dsh-taskboard/tasks/${idB}`)).json()
+    expect(fullB.value.admissionId).toBeUndefined()
+    expect(fullB.value.solutionRef).toBeUndefined()
+
+    // Update rewrites both fields.
+    const upd = await post(`/dsh-taskboard/tasks/${id}/update`, {
+      ifVersion: full.value.version,
+      admissionId: 'ADM-2024-002',
+      solutionRef: 'https://wiki.example.org/plans/42',
+    })
+    expect(upd.status).toBe(200)
+    full = await (await fetch(`${base}/dsh-taskboard/tasks/${id}`)).json()
+    expect(full.value.admissionId).toBe('ADM-2024-002')
+    expect(full.value.solutionRef).toBe('https://wiki.example.org/plans/42')
+
+    // null clears them (empty string would too).
+    const cleared = await post(`/dsh-taskboard/tasks/${id}/update`, { ifVersion: full.value.version, admissionId: null, solutionRef: null })
+    expect(cleared.status).toBe(200)
+    full = await (await fetch(`${base}/dsh-taskboard/tasks/${id}`)).json()
+    expect(full.value.admissionId).toBeUndefined()
+    expect(full.value.solutionRef).toBeUndefined()
+
+    // Oversized values are rejected.
+    const bad = await post('/dsh-taskboard/tasks', { title: 'Ref bad', workspaceId: 'ws-a', urgency: 'normal', solutionRef: 'x'.repeat(2001) })
+    expect(bad.status).toBe(400)
+  })
+
   it('merge: needs a branch; merges --no-ff and leaves a system comment; git failures map to 400', async () => {
     const created = await post('/dsh-taskboard/tasks', { title: 'Merge me', workspaceId: 'ws-a', urgency: 'normal' })
     const id = created.json.value.id as string
@@ -552,5 +611,185 @@ describe('taskboard routes', () => {
     expect(gitBehavior.removed).toEqual([`/proj/a/.dsh-worktrees/${id}`])
     expect(gitBehavior.deletedBranches).toEqual(['task/Purge-me+t-p'])
     expect(store.get(id)).toBeUndefined()
+  })
+})
+
+describe('taskboard routes 0.4.0 (checklist / templates / import / diff)', () => {
+  // ------------------------------------------------------------- checklist
+  it('create accepts checklist texts; update replaces the whole list or clears it', async () => {
+    const created = await post('/dsh-taskboard/tasks', {
+      title: '带清单任务', workspaceId: 'ws-a', urgency: 'normal', checklist: ['复现', '修复', '回归通过'],
+    })
+    expect(created.status).toBe(201)
+    const id = created.json.value.id as string
+    const task = await (await fetch(`${base}/dsh-taskboard/tasks/${id}`)).json()
+    expect(task.value.checklist).toHaveLength(3)
+    expect(task.value.checklist[0]).toMatchObject({ text: '复现', checked: false })
+
+    // Full replace: check one item, drop another (ids preserved where kept).
+    const items = (task.value.checklist as Array<{ id: string; text: string }>)
+    const replaced = await post(`/dsh-taskboard/tasks/${id}/update`, {
+      ifVersion: 1,
+      checklist: [
+        { id: items[0]!.id, text: '复现', checked: true, checkedBy: 'user', checkedAt: 5 },
+        { text: '新增项' },
+      ],
+    })
+    expect(replaced.status).toBe(200)
+    const after = (await (await fetch(`${base}/dsh-taskboard/tasks/${id}`)).json()).value
+    expect(after.checklist).toHaveLength(2)
+    expect(after.checklist[0]).toMatchObject({ checked: true, checkedBy: 'user' })
+    expect(after.checklist[1]!.id).not.toBe(items[1]!.id) // minted for the new row
+
+    // null clears.
+    const cleared = await post(`/dsh-taskboard/tasks/${id}/update`, { ifVersion: 2, checklist: null })
+    expect(cleared.status).toBe(200)
+    const done = (await (await fetch(`${base}/dsh-taskboard/tasks/${id}`)).json()).value
+    expect(done.checklist).toBeUndefined()
+
+    // Bad payload rejected.
+    const bad = await post('/dsh-taskboard/tasks', { title: 'x', workspaceId: 'ws-a', urgency: 'normal', checklist: [1] })
+    expect(bad.status).toBe(400)
+  })
+
+  // ------------------------------------------------------------- templates
+  it('templates: seeds built-ins, upserts, renames, deletes', async () => {
+    const list = await (await fetch(`${base}/dsh-taskboard/templates`)).json()
+    const names = (list.value.templates as Array<{ name: string; builtin?: boolean }>).map(t => t.name)
+    expect(names).toContain('Bug 修复')
+    expect(names).toContain('发布检查')
+    expect(names).toContain('例行巡检')
+
+    const created = await post('/dsh-taskboard/templates', {
+      name: '我的模板',
+      task: { title: '从模板开始', urgency: 'urgent', checklist: ['a', 'b'], execution: { mode: 'scheduled', cron: '0 9 * * 1' } },
+    })
+    expect(created.status).toBe(201)
+    const id = created.json.value.id as string
+    expect(created.json.value.task.checklist).toEqual(['a', 'b'])
+
+    const renamed = await post('/dsh-taskboard/templates', { id, name: '改名后', task: { urgency: 'relaxed' } })
+    expect(renamed.status).toBe(201)
+
+    // Bad spec rejected.
+    const bad = await post('/dsh-taskboard/templates', { name: 'x', task: { urgency: 'hot' } })
+    expect(bad.status).toBe(400)
+
+    const deleted = await post('/dsh-taskboard/templates/delete', { id })
+    expect(deleted.json.value.deleted).toBe(true)
+    const after = await (await fetch(`${base}/dsh-taskboard/templates`)).json()
+    expect((after.value.templates as Array<{ id: string }>).some(t => t.id === id)).toBe(false)
+  })
+
+  // ---------------------------------------------------------------- import
+  it('import: preview classifies; merge upserts by id; replace swaps with backup; running → failed', async () => {
+    // A live task to overwrite.
+    const live = await post('/dsh-taskboard/tasks', { title: '将被覆盖', workspaceId: 'ws-a', urgency: 'normal' })
+    const liveId = live.json.value.id as string
+
+    const file = {
+      schemaVersion: 1,
+      tasks: [
+        {
+          id: liveId, title: '覆盖后的标题', workspaceId: 'ws-a', urgency: 'relaxed',
+          comments: [], executions: [{ trigger: 'manual', outcome: 'running', sessionId: 's-old' }],
+        },
+        { id: 't-imported', title: '新导入', workspaceId: 'ws-b', urgency: 'urgent', comments: [], executions: [] },
+        { id: 't-broken', title: '', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] },
+      ],
+    }
+
+    // Dry-run: nothing written yet.
+    const preview = await post('/dsh-taskboard/import/preview', file)
+    expect(preview.status).toBe(200)
+    expect(preview.json.value.plan.create).toEqual([{ id: 't-imported', title: '新导入', status: 'todo' }])
+    expect(preview.json.value.plan.overwrite).toHaveLength(1)
+    expect(preview.json.value.plan.overwrite[0].title).toBe('覆盖后的标题')
+    expect(preview.json.value.plan.invalid).toEqual([{ id: 't-broken', reason: expect.any(String) }])
+    expect(store.get('t-imported')).toBeUndefined()
+
+    // Bad schema refused outright.
+    const badSchema = await post('/dsh-taskboard/import/preview', { schemaVersion: 99, tasks: [] })
+    expect(badSchema.status).toBe(400)
+    expect(badSchema.json.error.message).toContain('schemaVersion')
+
+    // Merge commit: overwrite + create; the running execution lands as failed.
+    const merged = await post('/dsh-taskboard/import', { mode: 'merge', ledger: file })
+    expect(merged.status).toBe(200)
+    expect(merged.json.value).toMatchObject({ mode: 'merge', created: 1, overwritten: 1 })
+    const overwritten = store.get(liveId)!
+    expect(overwritten.title).toBe('覆盖后的标题')
+    expect(overwritten.executions[0]!.outcome).toBe('failed')
+    expect(store.get('t-imported')!.title).toBe('新导入')
+
+    // Replace: whole-ledger swap with an automatic backup file written.
+    const before = store.snapshot()
+    const tinyFile = { schemaVersion: 1, tasks: [{ id: 't-only', title: '唯一', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] }] }
+    const replaced = await post('/dsh-taskboard/import', { mode: 'replace', ledger: tinyFile })
+    expect(replaced.status).toBe(200)
+    expect(replaced.json.value.mode).toBe('replace')
+    expect(replaced.json.value.backupFile).toContain('backup-')
+    expect(store.snapshot().tasks.map(t => t.id)).toEqual(['t-only'])
+
+    // Replace with zero importable tasks is refused (would wipe for nothing).
+    const refused = await post('/dsh-taskboard/import', { mode: 'replace', ledger: { schemaVersion: 1, tasks: [{ id: 'z', title: '', workspaceId: 'x', urgency: 'normal', comments: [], executions: [] }] } })
+    expect(refused.status).toBe(400)
+
+    // Restore the pre-replace ledger (merge the snapshot back) for later tests.
+    await store.mutate('task-created', ledger => {
+      ledger.tasks = structuredClone(before.tasks)
+      return ledger.tasks
+    })
+  })
+
+  // ------------------------------------------------------------------ diff
+  it('diff endpoint: serves commits and paths from the live worktree, falls back to the main repo', async () => {
+    const created = await post('/dsh-taskboard/tasks', { title: 'Diff 任务', workspaceId: 'ws-a', urgency: 'normal' })
+    const id = created.json.value.id as string
+    await store.mutate('execution-recorded', ledger => {
+      const target = ledger.tasks.find(t => t.id === id)!
+      target.branch = 'task/diff+t-d'
+      target.executions.push({
+        id: 'e-diff', trigger: 'manual', startedAt: 1, outcome: 'succeeded',
+        isolation: 'worktree', branch: 'task/diff+t-d', worktreePath: '/proj/a/.dsh-worktrees/wt1', baseCommit: 'abc123',
+      })
+      return [target]
+    })
+
+    // Commit view: worktree first.
+    gitBehavior.showCommit = 'commit patch here'
+    const commit = await (await fetch(`${base}/dsh-taskboard/tasks/${id}/diff?execution=e-diff&commit=abc123`)).json()
+    expect(commit.value).toEqual({ diff: 'commit patch here', truncated: false })
+    expect(gitBehavior.showCommitCalls.at(-1)).toEqual({ cwd: '/proj/a/.dsh-worktrees/wt1', hash: 'abc123' })
+
+    // Commit miss in the worktree → retried in the main repo.
+    gitBehavior.showCommit = undefined
+    gitBehavior.showCommitCalls = []
+    const miss = await (await fetch(`${base}/dsh-taskboard/tasks/${id}/diff?execution=e-diff&commit=abc123`)).json()
+    expect(miss.ok).toBe(false)
+    expect(gitBehavior.showCommitCalls.map(c => c.cwd)).toEqual(['/proj/a/.dsh-worktrees/wt1', '/proj/a'])
+
+    // Path view: working-tree diff in the worktree.
+    gitBehavior.showPath = 'path patch'
+    const path = await (await fetch(`${base}/dsh-taskboard/tasks/${id}/diff?execution=e-diff&path=${encodeURIComponent('src/a.ts')}`)).json()
+    expect(path.value.diff).toBe('path patch')
+    expect(gitBehavior.showPathCalls.at(-1)).toMatchObject({ cwd: '/proj/a/.dsh-worktrees/wt1', path: 'src/a.ts' })
+
+    // Unknown execution / task → envelope failures.
+    const noExec = await (await fetch(`${base}/dsh-taskboard/tasks/${id}/diff?execution=nope&commit=abc123`)).json()
+    expect(noExec.ok).toBe(false)
+    expect(noExec.error.code).toBe('not_found')
+    const noTask = await fetch(`${base}/dsh-taskboard/tasks/ghost/diff?execution=e&commit=abc123`)
+    expect(noTask.status).toBe(404)
+
+    // No worktree on the execution: the main repo is used directly.
+    await store.mutate('execution-recorded', ledger => {
+      const target = ledger.tasks.find(t => t.id === id)!
+      target.executions.push({ id: 'e-diff2', trigger: 'manual', startedAt: 2, outcome: 'succeeded', baseCommit: 'abc123' })
+      return [target]
+    })
+    gitBehavior.showPathCalls = []
+    await fetch(`${base}/dsh-taskboard/tasks/${id}/diff?execution=e-diff2&path=${encodeURIComponent('src/b.ts')}`)
+    expect(gitBehavior.showPathCalls.at(-1)).toMatchObject({ cwd: '/proj/a', path: 'src/b.ts', base: 'abc123' })
   })
 })

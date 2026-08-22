@@ -1,4 +1,4 @@
-import { asIsolation, asStatus, asUrgency, canTransition, effectivePrompt, isClaim, isClaimedBy, newCommentId, newTaskId, normalizeBody, normalizeExecution, normalizeModel, normalizePrompt, normalizeTitle, summarize, syncClaim } from "../shared/protocol.js";
+import { asIsolation, asStatus, asUrgency, canTransition, checklistFromTexts, effectivePrompt, isClaim, isClaimedBy, newCommentId, newTaskId, normalizeAdmissionId, normalizeBody, normalizeExecution, normalizeExecutionReport, normalizeModel, normalizePrompt, normalizeSolutionRef, normalizeTitle, summarize, syncClaim } from "../shared/protocol.js";
 import { defineTool } from "./sdk.js";
 //#region src/host/tools.ts
 /** Render side: one compact task line (id/status/version are load-bearing). */
@@ -7,6 +7,7 @@ function taskLine(t) {
 	if (t.blocked) parts.push("·受阻");
 	if (t.executionMode === "scheduled") parts.push("·定时");
 	if (t.commentCount !== void 0 && t.commentCount > 0) parts.push(`·评论${t.commentCount}`);
+	if (t.checklist !== void 0 && t.checklist.total > 0) parts.push(`·清单${t.checklist.done}/${t.checklist.total}`);
 	if (t.lastExecutionOutcome !== void 0) parts.push(`·上次执行${t.lastExecutionOutcome}`);
 	if (t.trashed === true) parts.push("·已删");
 	return parts.join(" ");
@@ -24,8 +25,20 @@ function taskDetail(t) {
 	if (t.execution.nextRunAt !== void 0) lines.push(`下次触发: ${new Date(t.execution.nextRunAt).toISOString()}`);
 	if (t.model !== void 0) lines.push(`固定模型: ${t.model.provider}/${t.model.model}`);
 	if (t.presetId !== void 0) lines.push(`执行模式: ${t.presetId}（未指定时为部署默认 preset）`);
+	if (t.admissionId !== void 0) lines.push(`准入 ID: ${t.admissionId}`);
+	if (t.solutionRef !== void 0) lines.push(`参考方案（链接或路径）: ${t.solutionRef}`);
 	lines.push(`描述: ${t.description.length > 0 ? t.description : "（无）"}`);
 	lines.push(`执行 Prompt: ${t.effectivePrompt ?? effectivePrompt(t)}`);
+	if (t.checklist !== void 0 && t.checklist.length > 0) {
+		const done = t.checklist.filter((i) => i.checked).length;
+		lines.push(`验收清单 (${done}/${t.checklist.length}):`);
+		for (const item of t.checklist) {
+			const mark = item.checked ? "☑" : "☐";
+			const who = item.checkedBy === void 0 ? "" : item.checkedBy === "user" ? " ·用户勾选" : ` ·agent ${String(item.checkedBy).slice(0, 24)}勾选`;
+			const note = item.note !== void 0 ? ` ·证据: ${item.note}` : "";
+			lines.push(`  ${mark} ${item.text}${who}${note}`);
+		}
+	}
 	if (t.comments.length > 0) {
 		lines.push(`评论 (${t.comments.length}):`);
 		for (const c of t.comments) {
@@ -38,7 +51,8 @@ function taskDetail(t) {
 		for (const e of t.executions) {
 			const at = e.startedAt !== void 0 ? new Date(e.startedAt).toISOString() : "?";
 			const err = e.error !== void 0 ? ` 错误: ${e.error}` : "";
-			lines.push(`  - [${e.trigger} ${at}] ${e.outcome}${err}`);
+			const report = e.report !== void 0 ? " [已交报告]" : "";
+			lines.push(`  - [${e.trigger} ${at}] ${e.outcome}${report}${err}`);
 		}
 	} else lines.push("执行记录: 无");
 	const updatedBy = t.updatedBy.kind === "agent" ? `agent ${String(t.updatedBy.sessionId).slice(0, 24)}` : "user";
@@ -237,7 +251,7 @@ function registerTaskboardTools(ctx, deps) {
 	})));
 	disposers.push(register(defineTool({
 		name: "taskboard_create",
-		description: "Create a task on the board. Required: title, workspaceId (project), urgency (urgent/normal/relaxed). Optional: description, prompt (sent to a fresh session on execution), status (default todo), execution mode (claim|scheduled + cron), model {provider, model} to pin executions to a model. Do not track trivial requests as tasks.",
+		description: "Create a task on the board. Required: title, workspaceId (project), urgency (urgent/normal/relaxed). Optional: description, prompt (sent to a fresh session on execution), status (default todo), execution mode (claim|scheduled + cron), model {provider, model} to pin executions to a model, admissionId (准入 ID), solutionRef (方案链接或路径，执行时发给执行会话). Do not track trivial requests as tasks.",
 		parameters: {
 			title: {
 				type: "string",
@@ -303,6 +317,19 @@ function registerTaskboardTools(ctx, deps) {
 			presetId: {
 				type: "string",
 				description: "Agent preset the execution session is composed from (its tool set / persona); default = the deployment default preset. Optional."
+			},
+			admissionId: {
+				type: "string",
+				description: "准入 ID（选填）：任务通过准入/工单审核时的编号；执行时随任务一并发给执行会话。"
+			},
+			solutionRef: {
+				type: "string",
+				description: "方案链接或路径（选填）：本任务参考方案的 URL 或本地文件路径；执行时随任务一并发给执行会话作为输入。"
+			},
+			checklist: {
+				type: "array",
+				description: `Acceptance checklist (DoD) item texts (≤30 × 200 chars); agents check them off at handoff, the user reviews.`,
+				items: { type: "string" }
 			}
 		},
 		output: {
@@ -327,6 +354,9 @@ function registerTaskboardTools(ctx, deps) {
 				const model = args.model !== void 0 ? checkModel(deps, args.model) : void 0;
 				const isolation = args.isolation === void 0 ? void 0 : asIsolation(args.isolation);
 				const presetId = args.presetId?.trim() || void 0;
+				const admissionId = normalizeAdmissionId(args.admissionId);
+				const solutionRef = normalizeSolutionRef(args.solutionRef);
+				const checklist = args.checklist !== void 0 ? checklistFromTexts(args.checklist) : void 0;
 				const now = deps.now();
 				const task = {
 					id: newTaskId(),
@@ -341,6 +371,9 @@ function registerTaskboardTools(ctx, deps) {
 					model,
 					...isolation !== void 0 ? { isolation } : {},
 					...presetId !== void 0 ? { presetId } : {},
+					...admissionId !== void 0 ? { admissionId } : {},
+					...solutionRef !== void 0 ? { solutionRef } : {},
+					...checklist !== void 0 ? { checklist } : {},
 					version: 1,
 					createdAt: now,
 					updatedAt: now,
@@ -361,7 +394,7 @@ function registerTaskboardTools(ctx, deps) {
 	})));
 	disposers.push(register(defineTool({
 		name: "taskboard_update",
-		description: "Update a task's title/description/prompt/urgency/blocked. Requires ifVersion (read first). The model and execution config are read-only through this tool (they belong to the task owner/user).",
+		description: "Update a task's title/description/prompt/urgency/blocked/admissionId/solutionRef. Requires ifVersion (read first). The model and execution config are read-only through this tool (they belong to the task owner/user).",
 		parameters: {
 			id: {
 				type: "string",
@@ -392,6 +425,14 @@ function registerTaskboardTools(ctx, deps) {
 			blocked: {
 				type: "boolean",
 				description: "Blocked marker (work cannot continue right now)."
+			},
+			admissionId: {
+				type: "string",
+				description: "New 准入 ID（空字符串清除）. Optional."
+			},
+			solutionRef: {
+				type: "string",
+				description: "New 方案链接或路径（空字符串清除）. Optional."
 			}
 		},
 		output: {
@@ -417,6 +458,16 @@ function registerTaskboardTools(ctx, deps) {
 				if (args.prompt !== void 0) next.prompt = normalizePrompt(args.prompt);
 				if (args.urgency !== void 0) next.urgency = asUrgency(args.urgency);
 				if (args.blocked !== void 0) next.blocked = args.blocked;
+				if (args.admissionId !== void 0) {
+					const v = normalizeAdmissionId(args.admissionId ?? void 0);
+					if (v === void 0) delete next.admissionId;
+					else next.admissionId = v;
+				}
+				if (args.solutionRef !== void 0) {
+					const v = normalizeSolutionRef(args.solutionRef ?? void 0);
+					if (v === void 0) delete next.solutionRef;
+					else next.solutionRef = v;
+				}
 				next.version = task.version + 1;
 				next.updatedAt = deps.now();
 				next.updatedBy = actor;
@@ -631,6 +682,187 @@ function registerTaskboardTools(ctx, deps) {
 					return [next];
 				});
 				return { trashed: true };
+			} catch (error) {
+				fail(error);
+			}
+		}
+	})));
+	disposers.push(register(defineTool({
+		name: "taskboard_checklist",
+		description: "Manage the task's acceptance checklist (DoD). Actions: \"add\" (append item texts, ≤10 per call), \"check\" (mark an item done, with an optional evidence note), \"uncheck\" (reopen an item). Checking items NEVER completes the task — done stays a user-only action. Requires ifVersion.",
+		parameters: {
+			id: {
+				type: "string",
+				required: true,
+				description: "Task id."
+			},
+			action: {
+				type: "string",
+				required: true,
+				description: "add | check | uncheck."
+			},
+			ifVersion: {
+				type: "number",
+				required: true,
+				description: "Task version you read; fails on mismatch."
+			},
+			items: {
+				type: "array",
+				description: "Item texts to append (action=add only; 1..10 per call, 200 chars each).",
+				items: { type: "string" }
+			},
+			itemId: {
+				type: "string",
+				description: "The checklist item id (action=check/uncheck)."
+			},
+			note: {
+				type: "string",
+				description: "Evidence note recorded with the check (≤400 chars)."
+			}
+		},
+		output: {
+			schema: JSON_OUT,
+			render: (_args, value) => {
+				const v = value;
+				if (v.task === void 0 || v.checklist === void 0) return [{
+					type: "text",
+					text: "清单操作失败。"
+				}];
+				const lines = v.checklist.map((i, index) => `${i.checked === true ? "☑" : "☐"} [${index + 1}] ${String(i.text)}${i.note !== void 0 ? `（证据: ${String(i.note)}）` : ""} id=${String(i.id)}`);
+				return [{
+					type: "text",
+					text: `任务 ${v.task.id} 验收清单 ${v.done ?? 0}/${v.total ?? 0} 已完成，当前 v${v.task.version}：\n${lines.join("\n")}`
+				}];
+			}
+		},
+		async execute(args, exec) {
+			try {
+				const { actor } = caller(exec);
+				const task = store.get(args.id);
+				if (task === void 0 || task.trashedAt !== void 0) throw new ToolError(ERR.notFound, `no task ${args.id}`);
+				versionGuard(task, args.ifVersion);
+				if (task.status === "archived") throw new ToolError(ERR.invalidTransition, "archived tasks are immutable");
+				const next = structuredClone(task);
+				const checklist = next.checklist === void 0 ? [] : [...next.checklist];
+				if (args.action === "add") {
+					const texts = args.items ?? [];
+					if (texts.length === 0 || texts.length > 10) throw new ToolError(ERR.invalidInput, "items must carry 1..10 texts per add call");
+					if (checklist.length + texts.length > 30) throw new ToolError(ERR.invalidInput, `checklist may hold at most 30 items (currently ${checklist.length})`);
+					checklist.push(...checklistFromTexts(texts));
+				} else if (args.action === "check") {
+					if (args.itemId === void 0) throw new ToolError(ERR.invalidInput, "itemId is required for check");
+					const item = checklist.find((i) => i.id === args.itemId);
+					if (item === void 0) throw new ToolError(ERR.notFound, `no checklist item ${args.itemId} (task ${args.id})`);
+					const note = args.note !== void 0 && args.note.trim().length > 0 ? args.note.trim().slice(0, 400) : void 0;
+					item.checked = true;
+					item.checkedBy = actor.sessionId;
+					item.checkedAt = deps.now();
+					if (note !== void 0) item.note = note;
+				} else if (args.action === "uncheck") {
+					if (args.itemId === void 0) throw new ToolError(ERR.invalidInput, "itemId is required for uncheck");
+					const item = checklist.find((i) => i.id === args.itemId);
+					if (item === void 0) throw new ToolError(ERR.notFound, `no checklist item ${args.itemId} (task ${args.id})`);
+					item.checked = false;
+					delete item.checkedBy;
+					delete item.checkedAt;
+					delete item.note;
+				} else throw new ToolError(ERR.invalidInput, `action must be add | check | uncheck (got "${args.action}")`);
+				if (checklist.length > 0) next.checklist = checklist;
+				else delete next.checklist;
+				next.version = task.version + 1;
+				next.updatedAt = deps.now();
+				next.updatedBy = actor;
+				await store.mutate("task-updated", (ledger) => {
+					const i = ledger.tasks.findIndex((t) => t.id === args.id);
+					ledger.tasks[i] = next;
+					return [next];
+				});
+				const progress = next.checklist !== void 0 ? {
+					done: next.checklist.filter((i) => i.checked).length,
+					total: next.checklist.length
+				} : {
+					done: 0,
+					total: 0
+				};
+				return json({
+					task: {
+						id: next.id,
+						version: next.version
+					},
+					checklist: next.checklist ?? [],
+					...progress
+				});
+			} catch (error) {
+				fail(error);
+			}
+		}
+	})));
+	disposers.push(register(defineTool({
+		name: "taskboard_execution_report",
+		description: "Submit the structured execution report for the task you are currently executing (summary / changed files / how you verified / artifacts / remaining risk). Submit BEFORE moving the task to in_review; a later submission overwrites the previous report. Commits and diffs are host-collected — do not repeat them.",
+		parameters: {
+			summary: {
+				type: "string",
+				required: true,
+				description: "What was done (1..2000 chars)."
+			},
+			changedFiles: {
+				type: "array",
+				description: "Files you changed (paths, ≤50 × 300 chars).",
+				items: { type: "string" }
+			},
+			checks: {
+				type: "array",
+				description: "How the work was verified (e.g. test commands + outcomes, ≤50 entries).",
+				items: { type: "string" }
+			},
+			artifacts: {
+				type: "array",
+				description: "Artifacts worth reviewing (build outputs, screenshots, docs, ≤30 entries).",
+				items: { type: "string" }
+			},
+			risk: {
+				type: "string",
+				description: "Known remaining risks or follow-ups (≤2000 chars, optional)."
+			}
+		},
+		output: {
+			schema: JSON_OUT,
+			render: (_args, value) => {
+				const v = value;
+				if (v.taskId === void 0 || v.report === void 0) return [{
+					type: "text",
+					text: "报告提交失败。"
+				}];
+				return [{
+					type: "text",
+					text: `执行报告已记录到任务 ${v.taskId}（执行 ${v.executionId}）：${v.report.summary?.slice(0, 120) ?? ""}\n接下来：taskboard_comment_add 留交接评论，然后 taskboard_move 移至待验收 in_review。`
+				}];
+			}
+		},
+		async execute(args, exec) {
+			try {
+				const { sessionId } = caller(exec);
+				const report = normalizeExecutionReport(args);
+				let taskId;
+				let executionId;
+				await store.mutate("execution-recorded", (ledger) => {
+					for (const task of ledger.tasks) {
+						const execution = task.executions.find((e) => e.sessionId === sessionId && e.outcome === "running");
+						if (execution !== void 0) {
+							execution.report = report;
+							taskId = task.id;
+							executionId = execution.id;
+							return [task];
+						}
+					}
+				});
+				if (taskId === void 0 || executionId === void 0) throw new ToolError(ERR.forbidden, "no running execution belongs to this session — the report can only be submitted while the taskboard execution session is still running");
+				return json({
+					taskId,
+					executionId,
+					report
+				});
 			} catch (error) {
 				fail(error);
 			}

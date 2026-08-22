@@ -1,4 +1,4 @@
-import { asIsolation, asStatus, asUrgency, canTransition, newCommentId, newTaskId, normalizeBody, normalizeExecution, normalizeModel, normalizePrompt, normalizeTitle, summarize, syncClaim } from "../shared/protocol.js";
+import { asIsolation, asStatus, asUrgency, canTransition, checklistFromTexts, newCommentId, newTaskId, normalizeAdmissionId, normalizeBody, normalizeChecklist, normalizeExecution, normalizeModel, normalizePrompt, normalizeSolutionRef, normalizeTitle, summarize, syncClaim, validateLedgerImport } from "../shared/protocol.js";
 import { WORKTREE_DIR, worktreePathOf } from "./git.js";
 import { ROUTE_PREFIX, SSE_PATH } from "../shared/api.js";
 import { join } from "node:path";
@@ -8,6 +8,38 @@ import { readdir, rm } from "node:fs/promises";
 const HEARTBEAT_MS = 2e4;
 /** How long a workspace git-detection result stays cached (fail-soft). */
 const GIT_DETECT_TTL_MS = 6e4;
+/** Validate a template's task spec (routes-side, unknown → invalid_input). */
+function normalizeTemplateSpec(raw) {
+	if (typeof raw !== "object" || raw === null) throw new Error("Error: invalid_input: task must be an object");
+	const e = raw;
+	const spec = {};
+	const str = (key) => {
+		const v = e[key];
+		if (v === void 0) return void 0;
+		if (typeof v !== "string") throw new Error(`Error: invalid_input: task.${key} must be a string`);
+		return v;
+	};
+	const title = str("title");
+	const description = str("description");
+	const prompt = str("prompt");
+	const urgency = str("urgency");
+	const isolation = str("isolation");
+	const presetId = str("presetId");
+	if (title !== void 0) spec.title = normalizeTitle(title);
+	if (description !== void 0) spec.description = description;
+	if (prompt !== void 0) spec.prompt = normalizePrompt(prompt);
+	if (urgency !== void 0) spec.urgency = asUrgency(urgency);
+	if (isolation !== void 0) spec.isolation = asIsolation(isolation);
+	if (presetId !== void 0 && presetId.trim().length > 0) spec.presetId = presetId.trim();
+	if (e.execution !== void 0) spec.execution = normalizeExecution(e.execution, Date.now());
+	if (e.model !== void 0) spec.model = normalizeModel(e.model);
+	if (e.checklist !== void 0) {
+		if (!Array.isArray(e.checklist) || e.checklist.some((c) => typeof c !== "string")) throw new Error("Error: invalid_input: task.checklist must be an array of strings");
+		checklistFromTexts(e.checklist);
+		spec.checklist = e.checklist;
+	}
+	return spec;
+}
 /** Validate a pinned model: structural check always, provider route when known. */
 function checkModel(raw, modelProviders) {
 	const model = normalizeModel(raw);
@@ -163,7 +195,8 @@ function registerTaskboardRoutes(ctx, options) {
 	};
 	const handler = async (req, res) => {
 		try {
-			const pathname = new URL(req.url ?? "/", "http://x").pathname;
+			const url = new URL(req.url ?? "/", "http://x");
+			const pathname = url.pathname;
 			if (req.method === "GET") {
 				if (pathname === `/dsh-taskboard/state`) {
 					await store.load();
@@ -199,6 +232,49 @@ function registerTaskboardRoutes(ctx, options) {
 							orphanWorktrees: await listOrphanWorktrees(),
 							gitIgnoreSuggestions: await listGitignoreSuggestions()
 						}
+					});
+					return;
+				}
+				const diffMatch = pathname.match(new RegExp(`^${ROUTE_PREFIX}/tasks/([^/]+)/diff$`));
+				if (diffMatch !== null) {
+					try {
+						if (options.git === void 0) {
+							json(res, fail("invalid_input", "git integration unavailable").res, 501);
+							return;
+						}
+						const task = store.get(diffMatch[1]);
+						if (task === void 0) throw new Error("Error: not_found: no such task");
+						const execution = task.executions.find((e) => e.id === url.searchParams.get("execution"));
+						if (execution === void 0) throw new Error("Error: not_found: no such execution");
+						const commit = url.searchParams.get("commit");
+						const filePath = url.searchParams.get("path");
+						const ws = workspaces.get(task.workspaceId);
+						if (ws === void 0) throw new Error("Error: not_found: unknown workspace");
+						const cwd = execution.worktreePath ?? ws.path;
+						let result = commit !== null ? await options.git.showCommit(cwd, commit) : filePath !== null ? await options.git.showPathDiff(cwd, filePath, execution.baseCommit) : void 0;
+						if (result === void 0 && execution.worktreePath !== void 0 && cwd !== ws.path) result = commit !== null ? await options.git.showCommit(ws.path, commit) : filePath !== null && execution.baseCommit !== void 0 ? await options.git.showPathDiff(ws.path, filePath, execution.baseCommit) : void 0;
+						if (result === void 0) throw new Error("Error: invalid_input: 无法获取 diff（git 报错、对象不存在，或仅存于已删除的 worktree 且无基线）");
+						json(res, {
+							ok: true,
+							value: {
+								diff: result.text,
+								truncated: result.truncated
+							}
+						});
+					} catch (error) {
+						const f = toFail(error);
+						json(res, f.res, f.status);
+					}
+					return;
+				}
+				if (pathname === `/dsh-taskboard/templates`) {
+					if (options.templates === void 0) {
+						json(res, fail("invalid_input", "template store unavailable").res, 501);
+						return;
+					}
+					json(res, {
+						ok: true,
+						value: { templates: await options.templates.list() }
 					});
 					return;
 				}
@@ -246,6 +322,14 @@ function registerTaskboardRoutes(ctx, options) {
 					const isolationRaw = str(body, "isolation");
 					const isolation = isolationRaw === null ? void 0 : asIsolation(isolationRaw);
 					const presetId = normalizePresetId(str(body, "presetId"));
+					const admissionId = normalizeAdmissionId(str(body, "admissionId") ?? void 0);
+					const solutionRef = normalizeSolutionRef(str(body, "solutionRef") ?? void 0);
+					let checklist = void 0;
+					if (body.checklist !== void 0) {
+						if (!Array.isArray(body.checklist) || body.checklist.some((c) => typeof c !== "string")) throw new Error("Error: invalid_input: checklist must be an array of strings");
+						const texts = body.checklist.map((c) => c.trim()).filter((c) => c.length > 0);
+						if (texts.length > 0) checklist = checklistFromTexts(texts);
+					}
 					const now = options.now();
 					const task = {
 						id: newTaskId(),
@@ -260,6 +344,9 @@ function registerTaskboardRoutes(ctx, options) {
 						model,
 						...isolation !== void 0 ? { isolation } : {},
 						...presetId !== void 0 ? { presetId } : {},
+						...admissionId !== void 0 ? { admissionId } : {},
+						...solutionRef !== void 0 ? { solutionRef } : {},
+						...checklist !== void 0 ? { checklist } : {},
 						version: 1,
 						createdAt: now,
 						updatedAt: now,
@@ -318,6 +405,16 @@ function registerTaskboardRoutes(ctx, options) {
 						}
 						if (body.presetId === null) delete next.presetId;
 						else if (body.presetId !== void 0) next.presetId = normalizePresetId(str(body, "presetId"));
+						if (body.admissionId === null) delete next.admissionId;
+						else if (body.admissionId !== void 0) next.admissionId = normalizeAdmissionId(str(body, "admissionId") ?? void 0);
+						if (body.solutionRef === null) delete next.solutionRef;
+						else if (body.solutionRef !== void 0) next.solutionRef = normalizeSolutionRef(str(body, "solutionRef") ?? void 0);
+						if (body.checklist === null) delete next.checklist;
+						else if (body.checklist !== void 0) {
+							const items = normalizeChecklist(body.checklist);
+							if (items.length > 0) next.checklist = items;
+							else delete next.checklist;
+						}
 						next.version = task.version + 1;
 						next.updatedAt = options.now();
 						next.updatedBy = { kind: "user" };
@@ -618,6 +715,99 @@ function registerTaskboardRoutes(ctx, options) {
 							path
 						}
 					});
+				} catch (error) {
+					const f = toFail(error);
+					json(res, f.res, f.status);
+				}
+				return;
+			}
+			if (pathname === `/dsh-taskboard/import/preview`) {
+				try {
+					const plan = validateLedgerImport(body, new Set(store.snapshot().tasks.map((t) => t.id)), options.now());
+					json(res, {
+						ok: true,
+						value: { plan: {
+							create: plan.create.map((t) => ({
+								id: t.id,
+								title: t.title,
+								status: t.status
+							})),
+							overwrite: plan.overwrite.map((t) => ({
+								id: t.id,
+								title: t.title,
+								status: t.status
+							})),
+							invalid: plan.invalid
+						} }
+					});
+				} catch (error) {
+					const f = toFail(error);
+					json(res, f.res, f.status);
+				}
+				return;
+			}
+			if (pathname === `/dsh-taskboard/import`) {
+				try {
+					const mode = str(body, "mode") === "replace" ? "replace" : "merge";
+					const raw = body.ledger;
+					const plan = validateLedgerImport(raw, new Set(store.snapshot().tasks.map((t) => t.id)), options.now());
+					const imported = [...plan.create, ...plan.overwrite];
+					if (mode === "replace" && imported.length === 0) throw new Error("Error: invalid_input: 导入文件没有可导入的任务，已拒绝整册替换");
+					let backupFile;
+					if (mode === "replace" && store.snapshot().tasks.length > 0) backupFile = await store.backup();
+					let replacedTotal;
+					await store.mutate("task-created", (ledger) => {
+						if (mode === "replace") {
+							replacedTotal = ledger.tasks.length;
+							ledger.tasks = structuredClone(imported);
+							return ledger.tasks;
+						}
+						const byId = new Map(ledger.tasks.map((t) => [t.id, t]));
+						for (const task of imported) byId.set(task.id, structuredClone(task));
+						ledger.tasks = [...byId.values()];
+						return structuredClone(imported);
+					});
+					json(res, {
+						ok: true,
+						value: {
+							mode,
+							created: plan.create.length,
+							overwritten: plan.overwrite.length,
+							...mode === "replace" ? { replacedTotal } : {},
+							...backupFile !== void 0 ? { backupFile } : {}
+						}
+					});
+				} catch (error) {
+					const f = toFail(error);
+					json(res, f.res, f.status);
+				}
+				return;
+			}
+			if (pathname === `/dsh-taskboard/templates` || pathname === `/dsh-taskboard/templates/delete`) {
+				try {
+					if (options.templates === void 0) {
+						json(res, fail("invalid_input", "template store unavailable").res, 501);
+						return;
+					}
+					if (pathname.endsWith("/delete")) {
+						const id = str(body, "id") ?? "";
+						if (id.length === 0) throw new Error("Error: invalid_input: id required");
+						json(res, {
+							ok: true,
+							value: { deleted: await options.templates.remove(id) }
+						});
+						return;
+					}
+					const name = str(body, "name") ?? "";
+					if (name.trim().length === 0) throw new Error("Error: invalid_input: name required");
+					json(res, {
+						ok: true,
+						value: await options.templates.upsert({
+							id: str(body, "id") ?? void 0,
+							name,
+							task: normalizeTemplateSpec(body.task)
+						})
+					}, 201);
 				} catch (error) {
 					const f = toFail(error);
 					json(res, f.res, f.status);

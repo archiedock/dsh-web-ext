@@ -178,4 +178,39 @@ describe('taskboard tool outputs', () => {
     expect(ok.task.model).toEqual({ provider: 'deepseek', model: 'reasoner' })
     for (const dispose of disposers) dispose()
   })
+
+  it('create/update carry 准入 ID and 方案链接或路径; get render surfaces them', async () => {
+    const { disposers, tool, exec } = await setup()
+    const created = await tool('taskboard_create').execute(
+      { title: 'Ref task', workspaceId: 'ws-a', urgency: 'normal', admissionId: ' ADM-9 ', solutionRef: '/docs/plan.md' }, exec,
+    ) as { task: { id: string } }
+    const id = created.task.id
+
+    // get: both fields land in the full record AND the render line (agent-facing).
+    const got = await tool('taskboard_get').execute({ id }, exec) as { task: { admissionId?: string; solutionRef?: string } }
+    expect(got.task.admissionId).toBe('ADM-9')
+    expect(got.task.solutionRef).toBe('/docs/plan.md')
+    const gotText = tool('taskboard_get').output.render({ id }, got)[0]!.text
+    expect(gotText).toContain('准入 ID')
+    expect(gotText).toContain('ADM-9')
+    expect(gotText).toContain('参考方案')
+    expect(gotText).toContain('/docs/plan.md')
+
+    // update rewrites, then an empty string clears.
+    let read = await tool('taskboard_get').execute({ id }, exec) as { task: { version: number } }
+    await tool('taskboard_update').execute(
+      { id, ifVersion: read.task.version, admissionId: 'ADM-10', solutionRef: 'https://wiki.example.org/plans/9' }, exec,
+    )
+    let got2 = await tool('taskboard_get').execute({ id }, exec) as { task: { admissionId?: string; solutionRef?: string; version: number } }
+    expect(got2.task.admissionId).toBe('ADM-10')
+    expect(got2.task.solutionRef).toBe('https://wiki.example.org/plans/9')
+
+    await tool('taskboard_update').execute({ id, ifVersion: got2.task.version, admissionId: ' ', solutionRef: '' }, exec)
+    const got3 = await tool('taskboard_get').execute({ id }, exec) as { task: { admissionId?: string; solutionRef?: string } }
+    expect(got3.task.admissionId).toBeUndefined()
+    expect(got3.task.solutionRef).toBeUndefined()
+
+    assertLossless(got2)
+    for (const dispose of disposers) dispose()
+  })
 })

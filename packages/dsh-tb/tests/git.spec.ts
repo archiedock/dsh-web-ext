@@ -307,4 +307,80 @@ describe('createGitFace (scripted exec)', () => {
       expect(structural[i]!.start).toBeGreaterThanOrEqual(structural[i - 1]!.end)
     }
   })
+
+  // ------------------------------------------------------------- 0.4.0 additions
+
+  it('showCommit: returns the capped patch; fail-soft on non-hash / git failure / empty', async () => {
+    const patch = 'commit abc\nAuthor: x\n\n+diff line'
+    const good = createGitFace(scripted([
+      { match: a => a[0] === 'show', result: ok(patch) },
+    ]))
+    expect(await good.showCommit('/wt', 'abc123')).toEqual({ text: patch, truncated: false })
+    expect(await good.showCommit('/wt', '--output=x')).toBeUndefined() // option-injection guard
+    const fail = createGitFace(scripted([
+      { match: a => a[0] === 'show', result: bad('unknown revision') },
+    ]))
+    expect(await fail.showCommit('/wt', 'abc123')).toBeUndefined()
+    const empty = createGitFace(scripted([
+      { match: a => a[0] === 'show', result: ok('   \n') },
+    ]))
+    expect(await empty.showCommit('/wt', 'abc123')).toBeUndefined()
+  })
+
+  it('showPathDiff: working-tree view without base, range view with base, -- separator, empty diff marker', async () => {
+    const exec = scripted([
+      { match: a => a[0] === 'diff' && a[1] === '--no-color' && a[2] === 'HEAD' && a.length === 5, result: ok('wt diff') },
+    ])
+    expect(await createGitFace(exec).showPathDiff('/wt', 'src/a.ts')).toEqual({ text: 'wt diff', truncated: false })
+
+    const rangeExec = scripted([
+      { match: a => a[0] === 'diff' && a[1] === '--no-color' && a[2] === 'abc123..HEAD', result: ok('range diff') },
+    ])
+    expect(await createGitFace(rangeExec).showPathDiff('/wt', '-weird-name.ts', 'abc123')).toEqual({ text: 'range diff', truncated: false })
+    // The path is guarded by the -- separator (never parsed as an option).
+    expect(rangeExec.calls.some(a => a.includes('--') && a.at(-1) === '-weird-name.ts')).toBe(true)
+
+    const emptyExec = scripted([
+      { match: a => a[0] === 'diff', result: ok('') },
+    ])
+    expect(await createGitFace(emptyExec).showPathDiff('/wt', 'clean.ts')).toEqual({ text: '（该文件无差异）', truncated: false })
+  })
+
+  it('showPathDiff caps oversized output by bytes and lines', async () => {
+    const huge = Array.from({ length: 3_000 }, () => 'x'.repeat(60)).join('\n')
+    const exec = scripted([
+      { match: a => a[0] === 'diff', result: ok(huge) },
+    ])
+    const result = await createGitFace(exec).showPathDiff('/wt', 'big.ts')
+    expect(result!.truncated).toBe(true)
+    expect(result!.text.split('\n').length).toBeLessThanOrEqual(2_000)
+    expect(result!.text.length).toBeLessThanOrEqual(128 * 1024)
+  })
+
+  it('showPathDiff synthesizes a new-file patch for untracked files', async () => {
+    // `git diff HEAD` misses untracked files entirely; the face falls through
+    // to status --porcelain then a --no-index diff (exit 1, stdout trusted).
+    const exec = scripted([
+      { match: a => a[0] === 'diff' && a[2] === 'HEAD', result: ok('') },
+      { match: a => a[0] === 'status' && a[1] === '--porcelain', result: ok('?? new.ts\n') },
+      { match: a => a[0] === 'diff' && a.includes('--no-index'), result: bad('exit 1: differences found') },
+    ])
+    // bad() carries no stdout — craft the no-index result with stdout directly.
+    const exec2 = scripted([
+      { match: a => a[0] === 'diff' && a[2] === 'HEAD', result: ok('') },
+      { match: a => a[0] === 'status' && a[1] === '--porcelain', result: ok('?? new.ts\n') },
+      { match: a => a[0] === 'diff' && a.includes('--no-index'), result: { ok: false, stdout: 'diff --git a/new.ts b/new.ts\n+line', stderr: '' } },
+    ])
+    expect(await createGitFace(exec2).showPathDiff('/wt', 'new.ts')).toEqual({ text: 'diff --git a/new.ts b/new.ts\n+line', truncated: false })
+    // A broken --no-index falls back to the plain untracked marker.
+    expect(await createGitFace(exec).showPathDiff('/wt', 'new.ts')).toEqual({ text: '（未跟踪新文件：new.ts）', truncated: false })
+    // A clean tracked file (status probe reports nothing untracked) keeps the
+    // no-difference marker.
+    const clean = scripted([
+      { match: a => a[0] === 'diff' && a[2] === 'HEAD', result: ok('') },
+      { match: a => a[0] === 'status' && a[1] === '--porcelain', result: ok('') },
+    ])
+    const cleanExec = createGitFace(clean)
+    expect(await cleanExec.showPathDiff('/wt', 'tracked.ts')).toEqual({ text: '（该文件无差异）', truncated: false })
+  })
 })

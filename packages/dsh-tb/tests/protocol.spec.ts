@@ -11,12 +11,17 @@ import {
   ALL_STATUSES,
   MAIN_STATUSES,
   canTransition,
+  checklistFromTexts,
+  checklistProgress,
   emptyLedger,
   isClaim,
   nextCronTime,
+  normalizeChecklist,
   normalizeExecution,
+  normalizeExecutionReport,
   parseCron,
   summarize,
+  validateLedgerImport,
   type TaskRecord,
 } from '../src/shared/protocol.ts'
 import { TASKBOARD_PROTOCOL } from '../src/host/protocol-text.ts'
@@ -130,6 +135,138 @@ describe('protocol text', () => {
     expect(TASKBOARD_PROTOCOL).toMatch(/backlog=未授权/)
     expect(TASKBOARD_PROTOCOL).toMatch(/模型与定时只读/)
     expect(TASKBOARD_PROTOCOL).toMatch(/项目边界/)
+  })
+
+  it('locks the 0.4.0 report/checklist handoff discipline', () => {
+    expect(TASKBOARD_PROTOCOL).toMatch(/taskboard_execution_report 提交结构化报告/)
+    expect(TASKBOARD_PROTOCOL).toMatch(/taskboard_checklist 逐项勾选/)
+    expect(TASKBOARD_PROTOCOL).toMatch(/清单全勾也不等于完成/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checklist (0.4.0)
+// ---------------------------------------------------------------------------
+
+describe('checklist', () => {
+  it('normalizes texts: trim, 1..200, cap 30 items', () => {
+    expect(() => checklistFromTexts(['  '])).toThrow('1..200')
+    expect(() => checklistFromTexts([`x`.repeat(201)])).toThrow('1..200')
+    expect(() => checklistFromTexts(Array.from({ length: 31 }, (_, i) => `item ${i}`))).toThrow('at most 30')
+    const items = checklistFromTexts(['  复现并定位根因  ', '回归测试通过'])
+    expect(items).toHaveLength(2)
+    expect(items[0]).toMatchObject({ text: '复现并定位根因', checked: false })
+    expect(typeof items[0]!.id).toBe('string')
+  })
+
+  it('normalizeChecklist mints missing ids, keeps evidence on checked, drops it on unchecked', () => {
+    const items = normalizeChecklist([
+      { text: 'a', checked: true, checkedBy: 'sess-9', checkedAt: 5, note: ' 测试通过 ' },
+      { text: 'b', checked: false, checkedBy: 'sess-9', checkedAt: 5, note: 'x' },
+    ])
+    expect(items[0]).toMatchObject({ text: 'a', checked: true, checkedBy: 'sess-9', checkedAt: 5, note: '测试通过' })
+    expect(items[1]).toEqual({ id: items[1]!.id, text: 'b', checked: false })
+    expect(() => normalizeChecklist('nope')).toThrow('array')
+    expect(() => normalizeChecklist([{ text: 'a' }, { text: 'b' }])).not.toThrow()
+  })
+
+  it('checklistProgress + summarize carry the progress', () => {
+    const task = makeTask('t-cl', { checklist: [
+      { id: 'k1', text: 'a', checked: true, checkedBy: 'user', checkedAt: 1 },
+      { id: 'k2', text: 'b', checked: false },
+    ] })
+    expect(checklistProgress(task)).toEqual({ done: 1, total: 2 })
+    expect(summarize(task).checklist).toEqual({ done: 1, total: 2 })
+    expect(summarize(makeTask('t-nocl')).checklist).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// execution report (0.4.0)
+// ---------------------------------------------------------------------------
+
+describe('execution report', () => {
+  it('normalizes a full report and defaults the optional lists', () => {
+    const report = normalizeExecutionReport({
+      summary: ' 修复了登录重定向 ',
+      changedFiles: [' src/a.ts ', 'src/b.ts'],
+      checks: ['npm test → 120 passed'],
+      artifacts: [],
+      risk: '',
+    })
+    expect(report).toEqual({
+      summary: '修复了登录重定向',
+      changedFiles: ['src/a.ts', 'src/b.ts'],
+      checks: ['npm test → 120 passed'],
+      artifacts: [],
+      risk: '',
+    })
+  })
+
+  it('rejects a missing summary and non-string list entries', () => {
+    expect(() => normalizeExecutionReport({})).toThrow('summary')
+    expect(() => normalizeExecutionReport({ summary: 'x', changedFiles: [42] })).toThrow('array of strings')
+    expect(() => normalizeExecutionReport({ summary: 'x', checks: Array.from({ length: 51 }, (_, i) => `c${i}`) })).toThrow('at most 50')
+    expect(() => normalizeExecutionReport({ summary: 'x', risk: 'r'.repeat(3000) })).not.toThrow() // risk is sliced, not thrown
+    expect(normalizeExecutionReport({ summary: 'x', risk: 'r'.repeat(3000) }).risk).toHaveLength(2000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ledger import validation (0.4.0)
+// ---------------------------------------------------------------------------
+
+describe('ledger import validation', () => {
+  const NOW = 10_000
+
+  it('classifies create / overwrite / invalid against the live ledger', () => {
+    const plan = validateLedgerImport({ schemaVersion: 1, tasks: [
+      { id: 't-live', title: '已存在', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] },
+      { id: 't-new', title: '新任务', workspaceId: 'ws-a', urgency: 'urgent', comments: [], executions: [] },
+      { id: '', title: '无 id', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] },
+      { id: 't-bad', title: '', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] },
+    ] }, new Set(['t-live']), NOW)
+    expect(plan.create.map(t => t.id)).toEqual(['t-new'])
+    expect(plan.overwrite.map(t => t.id)).toEqual(['t-live'])
+    expect(plan.invalid).toHaveLength(2)
+    expect(plan.invalid[1]).toMatchObject({ id: 't-bad', reason: expect.stringContaining('title') })
+  })
+
+  it('rejects unsupported schemaVersion, non-ledgers, and in-file duplicate ids', () => {
+    expect(() => validateLedgerImport({ schemaVersion: 2, tasks: [] }, new Set(), NOW)).toThrow('schemaVersion')
+    expect(() => validateLedgerImport('junk', new Set(), NOW)).toThrow('JSON')
+    const plan = validateLedgerImport({ schemaVersion: 1, tasks: [
+      { id: 't-x', title: '一', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] },
+      { id: 't-x', title: '二', workspaceId: 'ws-a', urgency: 'normal', comments: [], executions: [] },
+    ] }, new Set(), NOW)
+    expect(plan.create).toHaveLength(1)
+    expect(plan.invalid).toEqual([{ id: 't-x', reason: '文件内重复 id' }])
+  })
+
+  it('rebuilds records field by field: cron re-armed, running executions failed, defaults minted', () => {
+    const plan = validateLedgerImport({ schemaVersion: 1, tasks: [{
+      id: 't-imp',
+      title: '导入任务',
+      workspaceId: 'ws-a',
+      urgency: 'relaxed',
+      status: 'in_progress',
+      claimedBy: 'sess-x',
+      execution: { mode: 'scheduled', cron: '0 9 * * *' },
+      comments: [{ body: '早', threadId: 'sess-x' }],
+      executions: [{ trigger: 'manual', outcome: 'running', sessionId: 'sess-x' }],
+      checklist: [{ text: '验收项', checked: true, checkedBy: 'user' }],
+      presetId: ' standard ',
+    }] }, new Set(), NOW)
+    expect(plan.create).toHaveLength(1)
+    const task = plan.create[0]!
+    expect(task.execution.nextRunAt).toBeGreaterThan(NOW)
+    expect(task.comments[0]!.id).toMatch(/^c-/)
+    expect(task.executions[0]!.outcome).toBe('failed')
+    expect(task.executions[0]!.error).toContain('running')
+    expect(task.checklist![0]).toMatchObject({ text: '验收项', checked: true, checkedBy: 'user' })
+    expect(task.presetId).toBe('standard')
+    expect(task.claimedBy).toBe('sess-x')
+    expect(task.createdBy).toEqual({ kind: 'user' })
   })
 })
 
@@ -308,6 +445,7 @@ async function toolSet(cwd: string): Promise<Map<string, { execute(args: unknown
   }
   registerTaskboardTools(ctx as never, deps)
   ;(tools as { __dir?: string }).__dir = dir
+  ;(tools as { __store?: typeof store }).__store = store
   return tools
 }
 
@@ -417,5 +555,102 @@ describe('taskboard tools', () => {
       .rejects.toThrow(ERR.notFound)
     const list = await tools.get('taskboard_list')!.execute({}, agentExec('/proj/a')) as { tasks: unknown[] }
     expect(list.tasks).toHaveLength(1) // only t-2 remains visible
+  })
+
+  it('create carries a checklist from texts', async () => {
+    const tools = await toolSet('/proj/a')
+    const created = await tools.get('taskboard_create')!.execute(
+      { title: '带清单', workspaceId: 'ws-a', urgency: 'normal', checklist: ['复现', '修复'] },
+      agentExec('/proj/a'),
+    ) as { task: { id: string } }
+    const got = await tools.get('taskboard_get')!.execute({ id: created.task.id }, agentExec('/proj/a')) as { task: TaskRecord }
+    expect(got.task.checklist).toHaveLength(2)
+    expect(got.task.checklist![0]).toMatchObject({ text: '复现', checked: false })
+    await expect(tools.get('taskboard_create')!.execute(
+      { title: 'x', workspaceId: 'ws-a', urgency: 'normal', checklist: [42] }, agentExec('/proj/a'),
+    )).rejects.toThrow('invalid arguments')
+  })
+
+  it('taskboard_checklist: add / check (with evidence) / uncheck, version-gated', async () => {
+    const tools = await toolSet('/proj/a')
+    const exec = agentExec('/proj/a')
+    const tool = tools.get('taskboard_checklist')!
+
+    // add
+    const added = await tool.execute({ id: 't-1', action: 'add', ifVersion: 1, items: ['定位根因', '补回归测试'] }, exec) as {
+      task: { version: number }
+      checklist: Array<{ id: string; text: string; checked: boolean }>
+      done: number
+      total: number
+    }
+    expect(added.total).toBe(2)
+    expect(added.done).toBe(0)
+
+    // check with evidence note
+    const itemId = added.checklist[0]!.id
+    const checked = await tool.execute({ id: 't-1', action: 'check', ifVersion: added.task.version, itemId, note: '已写复现测试' }, exec) as {
+      task: { version: number }
+      checklist: Array<{ id: string; checked: boolean; checkedBy?: string; note?: string }>
+      done: number
+    }
+    expect(checked.done).toBe(1)
+    expect(checked.checklist[0]).toMatchObject({ checked: true, checkedBy: 'sess-1', note: '已写复现测试' })
+
+    // uncheck clears the attribution + note
+    const unchecked = await tool.execute({ id: 't-1', action: 'uncheck', ifVersion: checked.task.version, itemId }, exec) as {
+      task: { version: number }
+      checklist: Array<{ id: string; checked: boolean; checkedBy?: string; note?: string }>
+    }
+    expect(unchecked.checklist[0]).toEqual({ id: itemId, text: '定位根因', checked: false })
+
+    // gates: stale version, unknown item, bad action, empty add, per-call cap, total cap
+    await expect(tool.execute({ id: 't-1', action: 'add', ifVersion: 1, items: ['x'] }, exec)).rejects.toThrow(ERR.versionConflict)
+    const current = unchecked.task.version ?? 0
+    await expect(tool.execute({ id: 't-1', action: 'check', ifVersion: current, itemId: 'nope' }, exec)).rejects.toThrow(ERR.notFound)
+    await expect(tool.execute({ id: 't-1', action: 'nuke', ifVersion: current, items: [] }, exec)).rejects.toThrow('add | check | uncheck')
+    await expect(tool.execute({ id: 't-1', action: 'add', ifVersion: current, items: [] }, exec)).rejects.toThrow('1..10')
+    await expect(tool.execute({ id: 't-1', action: 'add', ifVersion: current, items: Array.from({ length: 11 }, (_, i) => `i${i}`) }, exec)).rejects.toThrow('1..10')
+    // total cap 30: climb to 22 then one more 10-pack must fail
+    let version = current
+    for (let round = 0; round < 2; round++) {
+      const step = await tool.execute({ id: 't-1', action: 'add', ifVersion: version, items: Array.from({ length: 10 }, (_, i) => `bulk${round}-${i}`) }, exec) as { task: { version: number } }
+      version = step.task.version
+    }
+    await expect(tool.execute({ id: 't-1', action: 'add', ifVersion: version, items: Array.from({ length: 10 }, (_, i) => `over-${i}`) }, exec)).rejects.toThrow('at most 30')
+  })
+
+  it('taskboard_execution_report: attaches to the session\'s running execution; overwrites; rejects without one', async () => {
+    const tools = await toolSet('/proj/a')
+    const exec = agentExec('/proj/a')
+    // No execution exists yet → forbidden with guidance.
+    await expect(tools.get('taskboard_execution_report')!.execute(
+      { summary: 'x' }, exec,
+    )).rejects.toThrow(ERR.forbidden)
+
+    // Give t-1 a running execution owned by sess-1 (same store the tools use).
+    const store = (tools as { __store?: TaskStore }).__store!
+    await store.mutate('execution-recorded', ledger => {
+      const task = ledger.tasks.find(t => t.id === 't-1')!
+      task.executions.push({ id: 'e-1', trigger: 'manual', startedAt: 1, outcome: 'running', sessionId: 'sess-1' })
+      return [task]
+    })
+
+    const report = await tools.get('taskboard_execution_report')!.execute({
+      summary: '修复完成', changedFiles: ['src/a.ts'], checks: ['npm test 通过'], risk: '无',
+    }, exec) as { taskId: string; executionId: string }
+    expect(report).toMatchObject({ taskId: 't-1', executionId: 'e-1' })
+
+    // Overwrite with a second submission.
+    await tools.get('taskboard_execution_report')!.execute({ summary: '更新后的报告' }, exec)
+    const got = await store.get('t-1')!
+    expect(got.executions[0]!.report!.summary).toBe('更新后的报告')
+
+    // Another session's running execution is not attachable.
+    await expect(tools.get('taskboard_execution_report')!.execute(
+      { summary: 'x' }, { agent: { id: 'sess-2', session: { header: { cwd: '/proj/a' } } } },
+    )).rejects.toThrow(ERR.forbidden)
+
+    // Invalid payload shape.
+    await expect(tools.get('taskboard_execution_report')!.execute({ changedFiles: ['a'] }, exec)).rejects.toThrow('summary')
   })
 })

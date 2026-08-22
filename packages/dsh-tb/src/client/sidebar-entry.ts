@@ -36,20 +36,23 @@ function sidebarRoot(): HTMLElement | undefined {
 /**
  * The New Session button: nested in the logo row on current shells, a direct
  * child BUTTON on the real shell (the family plugins' fallback), with
- * aria-label/text fallbacks for other shells.
+ * aria-label/text fallbacks for other shells. The direct-child scan skips
+ * our own entry (0.4.1): on shells where the insertion anchor lands inside a
+ * class-carrying container, a self-referential anchor would pin the entry
+ * against that container's own geometry instead of the family block.
  */
 function newSessionButton(root: HTMLElement): HTMLButtonElement | undefined {
   const nested = root.querySelector<HTMLButtonElement>('button[class*="newSession"]')
   if (nested !== null) return nested
   for (const child of root.children) {
-    if (child instanceof HTMLButtonElement) return child
+    if (child instanceof HTMLButtonElement && !child.matches(ENTRY_SELECTOR)) return child
   }
   const byAria = root.querySelector<HTMLButtonElement>(
     'button[aria-label="新建会话"], button[aria-label="New Session"], button[aria-label*="新会话"], button[aria-label*="new session" i]',
   )
   if (byAria !== null) return byAria
   const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
-  return buttons.find(button => /新会话|新建会话|new session/i.test(button.textContent ?? ''))
+  return buttons.find(button => !button.matches(ENTRY_SELECTOR) && /新会话|新建会话|new session/i.test(button.textContent ?? ''))
 }
 
 /** Build the entry row (a detached button; insert once the shell is up). */

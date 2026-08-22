@@ -66,7 +66,10 @@ console.log('tools registered:', registeredTools.join(', '))
 console.log('routes registered:', registeredRoutes.join(' | '))
 console.log('event subscriptions:', eventSubscriptions.join(', '))
 if (sectionCalls.length !== 1) throw new Error('expected exactly one section')
-if (registeredTools.length !== 8) throw new Error(`expected 8 tools, got ${registeredTools.length}`)
+if (registeredTools.length !== 10) throw new Error(`expected 10 tools, got ${registeredTools.length}`)
+for (const expected of ['taskboard_checklist', 'taskboard_execution_report']) {
+  if (!registeredTools.includes(expected)) throw new Error(`expected tool ${expected}`)
+}
 if (!registeredRoutes.some(r => r.includes('/dsh-taskboard'))) throw new Error('expected taskboard routes')
 if (!eventSubscriptions.includes('session/event')) throw new Error('expected session/event subscription')
 

@@ -11,12 +11,17 @@ import type {
   CreateTaskBody,
   DeleteTaskBody,
   DiagnosticsResponse,
+  DiffResponse,
+  ImportCommitResponse,
+  ImportPreviewResponse,
   MergeBranchResponse,
   MoveTaskBody,
   RejectTaskBody,
   RunTaskBody,
   StateResponse,
   TaskRecord,
+  TaskTemplate,
+  TemplatesResponse,
   UpdateTaskBody,
   WorktreeRemoveBody,
   WorkspaceView,
@@ -65,6 +70,18 @@ export interface TaskboardClient {
   diagnostics(): Promise<DiagnosticsResponse>
   /** Clean up one orphan worktree directory (task no longer in the ledger). */
   worktreeCleanup(workspaceId: string, taskId: string): Promise<{ cleaned: true; path: string }>
+  /** Diff view: one execution's commit or changed path (read-only, capped). */
+  diff(taskId: string, query: { execution: string; commit?: string; path?: string }): Promise<DiffResponse>
+  /** Import dry-run: classify the uploaded ledger against the live one. */
+  importPreview(file: unknown): Promise<ImportPreviewResponse>
+  /** Commit an import (merge upserts; replace swaps the whole ledger, backing it up first). */
+  importCommit(mode: 'merge' | 'replace', ledger: unknown): Promise<ImportCommitResponse>
+  /** List task templates. */
+  templates(): Promise<TemplatesResponse>
+  /** Create or replace a template. */
+  templateUpsert(body: { id?: string; name: string; task: TaskTemplate['task'] }): Promise<TaskTemplate>
+  /** Delete a template by id. */
+  templateDelete(id: string): Promise<{ deleted: boolean }>
   /** Subscribe to change frames; the disposer stops the stream. */
   stream(onChange: (event: ChangeEvent) => void, onGap: () => void): () => void
 }
@@ -87,6 +104,17 @@ export function createClient(): TaskboardClient {
     worktreeRemove: (id, body) => post(`/dsh-taskboard/tasks/${encodeURIComponent(id)}/worktree-remove`, body),
     diagnostics: () => unwrap<DiagnosticsResponse>(fetch('/dsh-taskboard/diagnostics')),
     worktreeCleanup: (workspaceId, taskId) => post('/dsh-taskboard/worktree-cleanup', { workspaceId, taskId }),
+    diff: (taskId, query) => {
+      const params = new URLSearchParams({ execution: query.execution })
+      if (query.commit !== undefined) params.set('commit', query.commit)
+      if (query.path !== undefined) params.set('path', query.path)
+      return unwrap<DiffResponse>(fetch(`/dsh-taskboard/tasks/${encodeURIComponent(taskId)}/diff?${params.toString()}`))
+    },
+    importPreview: file => post('/dsh-taskboard/import/preview', file),
+    importCommit: (mode, ledger) => post('/dsh-taskboard/import', { mode, ledger }),
+    templates: () => unwrap<TemplatesResponse>(fetch('/dsh-taskboard/templates')),
+    templateUpsert: body => post('/dsh-taskboard/templates', body),
+    templateDelete: id => post('/dsh-taskboard/templates/delete', { id }),
     stream(onChange, onGap) {
       const es = new EventSource('/dsh-taskboard/events')
       let revision: number | undefined

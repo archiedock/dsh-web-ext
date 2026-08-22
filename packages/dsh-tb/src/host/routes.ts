@@ -20,19 +20,26 @@ import {
   asStatus,
   asUrgency,
   canTransition,
+  checklistFromTexts,
   newCommentId,
   newTaskId,
+  normalizeAdmissionId,
   normalizeBody,
+  normalizeChecklist,
   normalizeExecution,
   normalizeModel,
   normalizePrompt,
+  normalizeSolutionRef,
   normalizeTitle,
   summarize,
   syncClaim,
+  validateLedgerImport,
   type TaskModel,
   type TaskRecord,
 } from '../shared/protocol.ts'
 import { WORKTREE_DIR, worktreePathOf, type GitFace } from './git.ts'
+import type { TaskTemplate } from '../shared/api.ts'
+import type { TemplateStore } from './templates.ts'
 import { ROUTE_PREFIX, SSE_PATH, type ApiFail, type ApiResult } from '../shared/api.ts'
 import type { TaskStore } from './store.ts'
 import type { WorkspaceFace } from './tools.ts'
@@ -62,6 +69,45 @@ export interface TaskboardRoutesOptions {
   modelProviders?: () => string[] | undefined
   /** Git face for worktree actions + workspace git detection; absent → 501 on git actions. */
   git?: GitFace
+  /** Task-template store (0.4.0); absent → 501 on template actions. */
+  templates?: TemplateStore
+}
+
+/** Validate a template's task spec (routes-side, unknown → invalid_input). */
+function normalizeTemplateSpec(raw: unknown): TaskTemplate['task'] {
+  if (typeof raw !== 'object' || raw === null) throw new Error('Error: invalid_input: task must be an object')
+  const e = raw as Record<string, unknown>
+  const spec: TaskTemplate['task'] = {}
+  const str = (key: string): string | undefined => {
+    const v = e[key]
+    if (v === undefined) return undefined
+    if (typeof v !== 'string') throw new Error(`Error: invalid_input: task.${key} must be a string`)
+    return v
+  }
+  const title = str('title')
+  const description = str('description')
+  const prompt = str('prompt')
+  const urgency = str('urgency')
+  const isolation = str('isolation')
+  const presetId = str('presetId')
+  if (title !== undefined) spec.title = normalizeTitle(title)
+  if (description !== undefined) spec.description = description
+  if (prompt !== undefined) spec.prompt = normalizePrompt(prompt)
+  if (urgency !== undefined) spec.urgency = asUrgency(urgency)
+  if (isolation !== undefined) spec.isolation = asIsolation(isolation)
+  if (presetId !== undefined && presetId.trim().length > 0) spec.presetId = presetId.trim()
+  if (e.execution !== undefined) {
+    spec.execution = normalizeExecution(e.execution as { mode?: string; cron?: string }, Date.now())
+  }
+  if (e.model !== undefined) spec.model = normalizeModel(e.model)
+  if (e.checklist !== undefined) {
+    if (!Array.isArray(e.checklist) || e.checklist.some(c => typeof c !== 'string')) {
+      throw new Error('Error: invalid_input: task.checklist must be an array of strings')
+    }
+    checklistFromTexts(e.checklist as string[]) // validates count + texts
+    spec.checklist = e.checklist as string[]
+  }
+  return spec
 }
 
 /** Validate a pinned model: structural check always, provider route when known. */
@@ -257,6 +303,60 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           })
           return
         }
+        // Diff viewer (0.4.0): read-only git show/diff for one execution's
+        // commit or changed path. Prefers the live worktree (uncommitted
+        // view), falls back to the main repo.
+        const diffMatch = pathname.match(new RegExp(`^${ROUTE_PREFIX}/tasks/([^/]+)/diff$`))
+        if (diffMatch !== null) {
+          try {
+            if (options.git === undefined) {
+              const f = fail('invalid_input', 'git integration unavailable')
+              json(res, f.res, 501)
+              return
+            }
+            const task = store.get(diffMatch[1]!)
+            if (task === undefined) throw new Error('Error: not_found: no such task')
+            const execution = task.executions.find(e => e.id === url.searchParams.get('execution'))
+            if (execution === undefined) throw new Error('Error: not_found: no such execution')
+            const commit = url.searchParams.get('commit')
+            const filePath = url.searchParams.get('path')
+            const ws = workspaces.get(task.workspaceId)
+            if (ws === undefined) throw new Error('Error: not_found: unknown workspace')
+            const cwd = execution.worktreePath ?? ws.path
+            let result = commit !== null
+              ? await options.git.showCommit(cwd, commit)
+              : filePath !== null ? await options.git.showPathDiff(cwd, filePath, execution.baseCommit) : undefined
+            // Fallback: the worktree may be gone — commits and committed
+            // ranges still resolve in the main repo.
+            if (result === undefined && execution.worktreePath !== undefined && cwd !== ws.path) {
+              result = commit !== null
+                ? await options.git.showCommit(ws.path, commit)
+                : filePath !== null && execution.baseCommit !== undefined
+                  ? await options.git.showPathDiff(ws.path, filePath, execution.baseCommit)
+                  : undefined
+            }
+            if (result === undefined) {
+              throw new Error('Error: invalid_input: 无法获取 diff（git 报错、对象不存在，或仅存于已删除的 worktree 且无基线）')
+            }
+            json(res, { ok: true, value: { diff: result.text, truncated: result.truncated } })
+          } catch (error) {
+            const f = toFail(error)
+            json(res, f.res, f.status)
+          }
+          return
+        }
+
+        // Templates listing (0.4.0).
+        if (pathname === `${ROUTE_PREFIX}/templates`) {
+          if (options.templates === undefined) {
+            const f = fail('invalid_input', 'template store unavailable')
+            json(res, f.res, 501)
+            return
+          }
+          json(res, { ok: true, value: { templates: await options.templates.list() } })
+          return
+        }
+
         const taskMatch = pathname.match(new RegExp(`^${ROUTE_PREFIX}/tasks/([^/]+)$`))
         if (taskMatch !== null) {
           const task = store.get(taskMatch[1]!)
@@ -301,6 +401,17 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           const isolationRaw = str(body, 'isolation')
           const isolation = isolationRaw === null ? undefined : asIsolation(isolationRaw)
           const presetId = normalizePresetId(str(body, 'presetId'))
+          const admissionId = normalizeAdmissionId(str(body, 'admissionId') ?? undefined)
+          const solutionRef = normalizeSolutionRef(str(body, 'solutionRef') ?? undefined)
+          let checklist: TaskRecord['checklist'] = undefined
+          if (body.checklist !== undefined) {
+            if (!Array.isArray(body.checklist) || body.checklist.some(c => typeof c !== 'string')) {
+              throw new Error('Error: invalid_input: checklist must be an array of strings')
+            }
+            const texts = (body.checklist as string[]).map(c => c.trim()).filter(c => c.length > 0)
+            if (texts.length > 0) checklist = checklistFromTexts(texts)
+          }
+
           const now = options.now()
           const task: TaskRecord = {
             id: newTaskId(),
@@ -315,6 +426,10 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
             model,
             ...(isolation !== undefined ? { isolation } : {}),
             ...(presetId !== undefined ? { presetId } : {}),
+            ...(admissionId !== undefined ? { admissionId } : {}),
+            ...(solutionRef !== undefined ? { solutionRef } : {}),
+            ...(checklist !== undefined ? { checklist } : {}),
+
             version: 1,
             createdAt: now,
             updatedAt: now,
@@ -381,6 +496,19 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
             // Preset may change any time: each run composes fresh.
             if (body.presetId === null) delete next.presetId
             else if (body.presetId !== undefined) next.presetId = normalizePresetId(str(body, 'presetId'))!
+            // 准入 ID / 方案链接或路径（选填）：null 清除，字符串规范化后写入。
+            if (body.admissionId === null) delete next.admissionId
+            else if (body.admissionId !== undefined) next.admissionId = normalizeAdmissionId(str(body, 'admissionId') ?? undefined)
+            if (body.solutionRef === null) delete next.solutionRef
+            else if (body.solutionRef !== undefined) next.solutionRef = normalizeSolutionRef(str(body, 'solutionRef') ?? undefined)
+            // Checklist (0.4.0): the GUI replaces the whole list; null clears.
+            if (body.checklist === null) delete next.checklist
+            else if (body.checklist !== undefined) {
+              const items = normalizeChecklist(body.checklist)
+              if (items.length > 0) next.checklist = items
+              else delete next.checklist
+            }
+
             next.version = task.version + 1
             next.updatedAt = options.now()
             next.updatedBy = { kind: 'user' }
@@ -650,6 +778,107 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
             }
           }
           json(res, { ok: true, value: { cleaned: true, path } })
+        } catch (error) {
+          const f = toFail(error)
+          json(res, f.res, f.status)
+        }
+        return
+      }
+
+      // ---------------------------------------------- POST /import/preview
+      // (0.4.0) Dry-run: classify every task in the uploaded ledger file
+      // against the live one; nothing is written.
+      if (pathname === `${ROUTE_PREFIX}/import/preview`) {
+        try {
+          const known = new Set(store.snapshot().tasks.map(t => t.id))
+          const plan = validateLedgerImport(body, known, options.now())
+          json(res, {
+            ok: true,
+            value: {
+              plan: {
+                create: plan.create.map(t => ({ id: t.id, title: t.title, status: t.status })),
+                overwrite: plan.overwrite.map(t => ({ id: t.id, title: t.title, status: t.status })),
+                invalid: plan.invalid,
+              },
+            },
+          })
+        } catch (error) {
+          const f = toFail(error)
+          json(res, f.res, f.status)
+        }
+        return
+      }
+
+      // ------------------------------------------------------ POST /import
+      // (0.4.0) Commit an import. mode=merge upserts (create + overwrite by
+      // id); mode=replace swaps the WHOLE ledger (invalid entries dropped)
+      // after writing a timestamped backup of the current one.
+      if (pathname === `${ROUTE_PREFIX}/import`) {
+        try {
+          const mode = str(body, 'mode') === 'replace' ? 'replace' as const : 'merge' as const
+          const raw = body.ledger
+          const known = new Set(store.snapshot().tasks.map(t => t.id))
+          const plan = validateLedgerImport(raw, known, options.now())
+          const imported = [...plan.create, ...plan.overwrite]
+          if (mode === 'replace' && imported.length === 0) {
+            throw new Error('Error: invalid_input: 导入文件没有可导入的任务，已拒绝整册替换')
+          }
+          let backupFile: string | undefined
+          if (mode === 'replace' && store.snapshot().tasks.length > 0) {
+            backupFile = await store.backup()
+          }
+          let replacedTotal: number | undefined
+          await store.mutate('task-created', ledger => {
+            if (mode === 'replace') {
+              replacedTotal = ledger.tasks.length
+              ledger.tasks = structuredClone(imported)
+              return ledger.tasks
+            }
+            const byId = new Map(ledger.tasks.map(t => [t.id, t]))
+            for (const task of imported) byId.set(task.id, structuredClone(task))
+            ledger.tasks = [...byId.values()]
+            return structuredClone(imported)
+          })
+          json(res, {
+            ok: true,
+            value: {
+              mode,
+              created: plan.create.length,
+              overwritten: plan.overwrite.length,
+              ...(mode === 'replace' ? { replacedTotal } : {}),
+              ...(backupFile !== undefined ? { backupFile } : {}),
+            },
+          })
+        } catch (error) {
+          const f = toFail(error)
+          json(res, f.res, f.status)
+        }
+        return
+      }
+
+      // ------------------------------------------- POST /templates (+delete)
+      if (pathname === `${ROUTE_PREFIX}/templates` || pathname === `${ROUTE_PREFIX}/templates/delete`) {
+        try {
+          if (options.templates === undefined) {
+            const f = fail('invalid_input', 'template store unavailable')
+            json(res, f.res, 501)
+            return
+          }
+          if (pathname.endsWith('/delete')) {
+            const id = str(body, 'id') ?? ''
+            if (id.length === 0) throw new Error('Error: invalid_input: id required')
+            const deleted = await options.templates.remove(id)
+            json(res, { ok: true, value: { deleted } })
+            return
+          }
+          const name = str(body, 'name') ?? ''
+          if (name.trim().length === 0) throw new Error('Error: invalid_input: name required')
+          const template = await options.templates.upsert({
+            id: str(body, 'id') ?? undefined,
+            name,
+            task: normalizeTemplateSpec(body.task),
+          })
+          json(res, { ok: true, value: template }, 201)
         } catch (error) {
           const f = toFail(error)
           json(res, f.res, f.status)

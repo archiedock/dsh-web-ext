@@ -92,6 +92,33 @@ try {
   await git.merge(root, branch)
   assert.equal(await git.isAncestor(root, branch), true, 'after merge → ancestor (no-op)')
 
+  // --- diff viewer (0.4.0): commit view, path views, caps, fallback ----------
+  // A MERGE commit's `git show` carries no patch — pick a regular commit.
+  const fixHash = (await run('log', '--format=%H', '--grep=fix: the login layout')).trim().split('\n')[0]
+  assert.ok(fixHash !== undefined && fixHash.length > 0, 'fixture commit found')
+  const commitView = await git.showCommit(wt, fixHash)
+  assert.ok(commitView !== undefined, 'commit view resolves in the worktree')
+  assert.ok(commitView.text.includes('diff --git'), 'commit view carries a patch')
+  assert.equal(commitView.truncated, false)
+  assert.equal(await git.showCommit(wt, 'nothash!'), undefined, 'non-hash ids are refused')
+
+  // Working-tree view: uncommitted change in a live worktree.
+  await writeFile(join(wt, 'dirty-view.txt'), 'dirty\n')
+  const wtView = await git.showPathDiff(wt, 'dirty-view.txt')
+  assert.ok(wtView !== undefined && wtView.text.includes('+dirty'), 'working-tree diff shows the uncommitted line')
+  // A clean path reports the explicit no-difference marker.
+  assert.equal((await git.showPathDiff(wt, 'base.txt')).text, '（该文件无差异）')
+  // Range view from the main repo (the worktree-removed fallback path).
+  const rangeView = await git.showPathDiff(root, 'fix.txt', info.baseCommit)
+  assert.ok(rangeView !== undefined && rangeView.text.length > 0, 'range diff resolves in the main repo')
+  // Caps: a huge generated diff is truncated, not unbounded.
+  await writeFile(join(wt, 'huge.txt'), 'line\n'.repeat(20_000))
+  const hugeView = await git.showPathDiff(wt, 'huge.txt')
+  assert.equal(hugeView.truncated, true, 'oversized diff is truncated')
+  assert.ok(hugeView.text.split('\n').length <= 2000, 'line cap respected')
+  await rm(join(wt, 'dirty-view.txt'))
+  await rm(join(wt, 'huge.txt'))
+
   // --- binaryAvailable --------------------------------------------------------
   assert.equal(await git.binaryAvailable(), true)
 

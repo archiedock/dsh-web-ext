@@ -26,10 +26,14 @@ import { registerTaskboardRoutes } from './host/routes.ts'
 import { SchedulerService } from './host/scheduler.ts'
 import { dshHomePath } from './host/sdk.ts'
 import { TaskStore } from './host/store.ts'
+import { TemplateStore } from './host/templates.ts'
 import { registerTaskboardTools, workspaceFace } from './host/tools.ts'
 
 /** Ledger file name under the DSH home. */
 export const LEDGER_FILE = 'dsh-taskboard.json'
+
+/** Task-template side file name under the DSH home (0.4.0). */
+export const TEMPLATES_FILE = 'dsh-taskboard-templates.json'
 
 /** Cordis plugin name. */
 export const name = 'dsh-taskboard'
@@ -43,6 +47,7 @@ export const inject = ['tools', 'systemPrompt']
  */
 export function apply(ctx: Context): void {
   const store = new TaskStore({ file: dshHomePath(LEDGER_FILE) })
+  const templates = new TemplateStore(dshHomePath(TEMPLATES_FILE))
   const now = () => Date.now()
   // Global execution concurrency cap (DSH_TASKBOARD_MAX_CONCURRENT overrides).
   const maxConcurrent = Math.max(1, Number.parseInt(process.env.DSH_TASKBOARD_MAX_CONCURRENT ?? '', 10) || DEFAULT_MAX_CONCURRENT)
@@ -153,6 +158,7 @@ export function apply(ctx: Context): void {
           cancel: (taskId: string) => execution.cancel(taskId),
           modelProviders,
           git,
+          templates,
         })
         return () => disposeRoutes?.()
       })

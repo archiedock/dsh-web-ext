@@ -46,6 +46,20 @@ window.__ModuleLoader__.load({
 					workspaceId,
 					taskId
 				}),
+				diff: (taskId, query) => {
+					const params = new URLSearchParams({ execution: query.execution });
+					if (query.commit !== void 0) params.set("commit", query.commit);
+					if (query.path !== void 0) params.set("path", query.path);
+					return unwrap(fetch(`/dsh-taskboard/tasks/${encodeURIComponent(taskId)}/diff?${params.toString()}`));
+				},
+				importPreview: (file) => post("/dsh-taskboard/import/preview", file),
+				importCommit: (mode, ledger) => post("/dsh-taskboard/import", {
+					mode,
+					ledger
+				}),
+				templates: () => unwrap(fetch("/dsh-taskboard/templates")),
+				templateUpsert: (body) => post("/dsh-taskboard/templates", body),
+				templateDelete: (id) => post("/dsh-taskboard/templates/delete", { id }),
 				stream(onChange, onGap) {
 					const es = new EventSource("/dsh-taskboard/events");
 					let revision;
@@ -211,6 +225,14 @@ window.__ModuleLoader__.load({
 				tasks: []
 			};
 		}
+		/** Checklist progress: how many items are checked (absent checklist → 0/0). */
+		function checklistProgress(task) {
+			const items = task.checklist ?? [];
+			return {
+				done: items.filter((i) => i.checked).length,
+				total: items.length
+			};
+		}
 
 		//#endregion
 		//#region src/client/controller.ts
@@ -269,7 +291,10 @@ window.__ModuleLoader__.load({
 				sortBy: view.sortBy,
 				composerOpen: false,
 				secondaryOpen: false,
-				diagOpen: false
+				diagOpen: false,
+				templates: [],
+				tplManagerOpen: false,
+				importOpen: false
 			};
 		}
 		/**
@@ -402,25 +427,36 @@ window.__ModuleLoader__.load({
 			select(id) {
 				this.setState({ selectedId: id });
 			}
-			/** Show/hide the task form (create mode when opening). */
+			/** Show/hide the task form (create mode when opening); always blank (no template prefill). */
 			setComposer(open) {
 				this.setState({
 					composerOpen: open,
-					editingId: void 0
+					editingId: void 0,
+					templatePrefill: void 0
 				});
 			}
-			/** Open the form modal editing an existing task. */
+			/** Open the create form prefilled from a chosen template (0.4.0). */
+			newFromTemplate(spec) {
+				this.setState({
+					composerOpen: true,
+					editingId: void 0,
+					templatePrefill: spec
+				});
+			}
+			/** Open the form modal editing an existing task (clears any template prefill). */
 			openEditor(id) {
 				this.setState({
 					composerOpen: true,
-					editingId: id
+					editingId: id,
+					templatePrefill: void 0
 				});
 			}
 			/** Close the form modal whatever its mode. */
 			closeForm() {
 				this.setState({
 					composerOpen: false,
-					editingId: void 0
+					editingId: void 0,
+					templatePrefill: void 0
 				});
 			}
 			/** Toggle the secondary tab. */
@@ -537,6 +573,42 @@ window.__ModuleLoader__.load({
 					this.setState({ error: error instanceof Error ? error.message : String(error) });
 				}
 			}
+			/**
+			* Toggle one checklist item as the USER (0.4.0): flips the item, records
+			* `checkedBy: 'user'`, keeps other items as they are (one update call).
+			*/
+			async toggleChecklistItem(task, itemId) {
+				const items = (task.checklist ?? []).map((item) => item.id === itemId ? item.checked ? {
+					id: item.id,
+					text: item.text,
+					checked: false
+				} : {
+					id: item.id,
+					text: item.text,
+					checked: true,
+					checkedBy: "user",
+					checkedAt: Date.now(),
+					...item.note !== void 0 ? { note: item.note } : {}
+				} : item);
+				try {
+					await this.client.update(task.id, {
+						ifVersion: task.version,
+						checklist: items
+					});
+					await this.refresh();
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+				}
+			}
+			/** Diff view (0.4.0): one execution's commit or changed path; errors surface via throw. */
+			async fetchDiff(taskId, query) {
+				try {
+					return await this.client.diff(taskId, query);
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+					return;
+				}
+			}
 			/** Append a user comment. */
 			async comment(id, body) {
 				try {
@@ -634,7 +706,7 @@ window.__ModuleLoader__.load({
 					this.setState({ error: error instanceof Error ? error.message : String(error) });
 				}
 			}
-			/** Duplicate a task into a fresh todo card (same project/urgency/prompt/execution/model/isolation). */
+			/** Duplicate a task into a fresh todo card (same project/urgency/prompt/execution/model/isolation/checklist). */
 			async duplicate(task) {
 				try {
 					await this.client.create({
@@ -649,11 +721,109 @@ window.__ModuleLoader__.load({
 						} : { mode: "claim" },
 						model: task.model,
 						isolation: task.isolation,
-						...task.presetId !== void 0 ? { presetId: task.presetId } : {}
+						...task.presetId !== void 0 ? { presetId: task.presetId } : {},
+						...task.admissionId !== void 0 ? { admissionId: task.admissionId } : {},
+						...task.solutionRef !== void 0 ? { solutionRef: task.solutionRef } : {},
+						...task.checklist !== void 0 && task.checklist.length > 0 ? { checklist: task.checklist.map((i) => i.text) } : {}
 					});
 					await this.refresh();
 				} catch (error) {
 					this.setState({ error: error instanceof Error ? error.message : String(error) });
+				}
+			}
+			/** Load the template list (best effort; errors surface). */
+			async loadTemplates() {
+				try {
+					const value = await this.client.templates();
+					this.setState({
+						templates: value.templates,
+						error: void 0
+					});
+					return value.templates;
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+					return [];
+				}
+			}
+			/** Open the + 新建任务 dropdown's template list fresh (called on menu open). */
+			prepareTemplateMenu() {
+				if (this.state.templates.length === 0) this.loadTemplates();
+			}
+			/** Open the template manager modal. */
+			openTemplateManager() {
+				this.setState({ tplManagerOpen: true });
+				this.loadTemplates();
+			}
+			/** Close the template manager modal. */
+			closeTemplateManager() {
+				this.setState({ tplManagerOpen: false });
+			}
+			/** Create or replace a template; refreshes the list. */
+			async upsertTemplate(body) {
+				try {
+					await this.client.templateUpsert(body);
+					await this.loadTemplates();
+					return true;
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+					return false;
+				}
+			}
+			/** Delete a template by id; refreshes the list. */
+			async deleteTemplate(id) {
+				try {
+					await this.client.templateDelete(id);
+					await this.loadTemplates();
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+				}
+			}
+			/** 存为模板 from a task card: carries every configurable field incl. checklist texts. */
+			async saveAsTemplate(task) {
+				return this.upsertTemplate({
+					name: task.title.slice(0, 60),
+					task: {
+						title: task.title,
+						description: task.description.length > 0 ? task.description : void 0,
+						prompt: task.prompt.length > 0 ? task.prompt : void 0,
+						urgency: task.urgency,
+						execution: task.execution.mode === "scheduled" && task.execution.cron !== void 0 ? {
+							mode: "scheduled",
+							cron: task.execution.cron
+						} : { mode: "claim" },
+						model: task.model,
+						isolation: task.isolation,
+						...task.presetId !== void 0 ? { presetId: task.presetId } : {},
+						...task.checklist !== void 0 && task.checklist.length > 0 ? { checklist: task.checklist.map((i) => i.text) } : {}
+					}
+				});
+			}
+			/** Open the import modal. */
+			openImport() {
+				this.setState({ importOpen: true });
+			}
+			/** Close the import modal. */
+			closeImport() {
+				this.setState({ importOpen: false });
+			}
+			/** Dry-run an import file: classify its tasks against the live ledger. */
+			async importPreview(file) {
+				try {
+					return (await this.client.importPreview(file)).plan;
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+					return;
+				}
+			}
+			/** Commit an import; refreshes the ledger afterwards. */
+			async importCommit(mode, ledger) {
+				try {
+					const value = await this.client.importCommit(mode, ledger);
+					await this.refresh();
+					return value;
+				} catch (error) {
+					this.setState({ error: error instanceof Error ? error.message : String(error) });
+					return;
 				}
 			}
 			/** Download the whole ledger as a JSON backup file. */
@@ -774,6 +944,26 @@ window.__ModuleLoader__.load({
 		@media (prefers-reduced-motion: reduce) {
 		  .dsh-atb-roll .dsh-atb-rn { transition: none; }
 		}
+
+		/* 0.4.3: collapsed rail. Collapsing the sidebar narrows it to an icon rail
+		 * (layout frame carries data-sidebar-collapsed; the sidebar root toggles its
+		 * CSS-Module *_collapsed class — dual signals, per the 0.4.2 shell doctrine).
+		 * The entry then mirrors the native rail geometry (36×36 icon button, no
+		 * label/stats) — matches .hHd-Xa_collapsed .hHd-Xa_newSession. */
+		[data-sidebar-collapsed] [data-dsh-atb-entry],
+		[class*="_collapsed"] [data-dsh-atb-entry] {
+		  width: 36px; height: 36px; min-width: 36px;
+		  margin: 0 0 12px; padding: 0;
+		  justify-content: center; gap: 0; text-align: center;
+		}
+		[data-sidebar-collapsed] [data-dsh-atb-entry] .dsh-atb-entry-label,
+		[data-sidebar-collapsed] [data-dsh-atb-entry] .dsh-atb-entry-stats,
+		[class*="_collapsed"] [data-dsh-atb-entry] .dsh-atb-entry-label,
+		[class*="_collapsed"] [data-dsh-atb-entry] .dsh-atb-entry-stats { display: none; }
+		/* Native rail icons render ~16-20px; scale ours up from 14px to read at parity. */
+		[data-sidebar-collapsed] [data-dsh-atb-entry] svg,
+		[class*="_collapsed"] [data-dsh-atb-entry] svg { width: 16px; height: 16px; }
+
 		.dsh-atb-search { width: 130px; }
 		.dsh-atb-badge[data-kind="stale"] { background: rgba(217,130,43,.15); color: #d9822b; }
 		/* Mobile-only controls: the shell's own sidebar-toggle lives in the session
@@ -784,6 +974,8 @@ window.__ModuleLoader__.load({
 		  .dsh-atb-mobile-nav { display: inline-flex; gap: 6px; }
 		}
 
+		/* 0.4.2: dual column matching — dev shell's data-pane pane OR the Desktop
+		 * shell's CSS-Module hashed centerCol (see board-mount.tsx). */
 		html[data-dsh-atb-active] [data-pane="conversation"] > *:not([data-dsh-atb-view]),
 		html[data-dsh-atb-active] [class*="centerCol"] > *:not([data-dsh-atb-view]) { display: none !important; }
 		.dsh-atb-view { display: none; }
@@ -1249,6 +1441,159 @@ window.__ModuleLoader__.load({
 		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.25));
 		}
 		.dsh-atb-diag-orphan-path { font-size: 11.5px; font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+
+		/* ---------- 0.4.0 checklist ---------- */
+		.dsh-atb-cke { display: flex; flex-direction: column; gap: 6px; }
+		.dsh-atb-cke-row { display: flex; align-items: center; gap: 8px; }
+		.dsh-atb-cke-box { flex-shrink: 0; width: 15px; height: 15px; cursor: pointer; }
+		.dsh-atb-cke-text {
+		  flex: 1; min-width: 0; font-size: 12.5px; padding: 6px 9px;
+		  border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.3));
+		  background: var(--dsw-alias-bg-layer-1, transparent); color: inherit;
+		}
+		.dsh-atb-cke-del {
+		  flex-shrink: 0; border: none; background: none; cursor: pointer; padding: 4px;
+		  color: var(--dsw-alias-label-tertiary, gray); font-size: 12px; border-radius: 6px;
+		}
+		.dsh-atb-cke-del:hover { color: var(--dsw-alias-state-error-primary, #e5484d); background: rgba(229,72,77,.08); }
+		.dsh-atb-cke-add {
+		  align-self: flex-start; border: 1px dashed var(--dsw-alias-border-l2, rgba(128,128,128,.4));
+		  background: none; color: var(--dsw-alias-label-secondary, inherit); cursor: pointer;
+		  font-size: 11.5px; padding: 5px 12px; border-radius: 8px;
+		}
+		.dsh-atb-cke-add:hover { color: var(--dsw-alias-state-business-primary, #3e63dd); border-color: var(--dsw-alias-state-business-primary, #3e63dd); }
+		.dsh-atb-cke-hint { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); }
+
+		.dsh-atb-cl-progress { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--dsw-alias-label-tertiary, gray); }
+		.dsh-atb-cl-progress[data-tone="bad"] { color: var(--dsw-alias-state-error-primary, #e5484d); font-weight: 600; }
+		.dsh-atb-cl-items { display: flex; flex-direction: column; gap: 5px; }
+		.dsh-atb-cl-item {
+		  display: flex; align-items: baseline; gap: 9px; padding: 6px 9px; border-radius: 8px;
+		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.22));
+		  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.03)); cursor: pointer;
+		}
+		.dsh-atb-cl-item:hover { border-color: var(--dsw-alias-border-l2, rgba(128,128,128,.4)); }
+		.dsh-atb-cl-item input { flex-shrink: 0; transform: translateY(1px); cursor: pointer; }
+		.dsh-atb-cl-item[data-checked="true"] .dsh-atb-cl-text { text-decoration: line-through; color: var(--dsw-alias-label-tertiary, gray); }
+		.dsh-atb-cl-item[data-alert="true"] {
+		  border-color: rgba(229,72,77,.45); background: rgba(229,72,77,.06);
+		}
+		.dsh-atb-cl-text { flex: 1; min-width: 0; font-size: 12.5px; word-break: break-word; }
+		.dsh-atb-cl-meta { flex-shrink: 0; font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }
+		.dsh-atb-cl-note { max-width: 280px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dsw-alias-label-secondary, inherit); }
+
+		/* ---------- 0.4.0 report ---------- */
+		.dsh-atb-rpt-summary { font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; margin-bottom: 8px; }
+		.dsh-atb-rpt-sec { margin-bottom: 8px; }
+		.dsh-atb-rpt-label { font-size: 11px; color: var(--dsw-alias-label-tertiary, gray); margin-bottom: 4px; }
+		.dsh-atb-rpt-list { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.55; word-break: break-all; }
+		.dsh-atb-rpt-risk {
+		  font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+		  color: var(--dsw-alias-state-warn-primary, #f5a524);
+		  background: rgba(245,165,36,.08); border: 1px solid rgba(245,165,36,.3);
+		  border-radius: 8px; padding: 6px 10px;
+		}
+
+		/* ---------- 0.4.0 diff viewer ---------- */
+		.dsh-atb-iso-commit { display: flex; flex-direction: column; gap: 3px; }
+		.dsh-atb-iso-commit-btn {
+		  display: flex; gap: 8px; font-size: 11.5px; align-items: baseline; text-align: left;
+		  border: none; background: none; padding: 2px 4px; margin: 0 -4px; border-radius: 6px; cursor: pointer;
+		  color: inherit; width: fit-content; max-width: 100%;
+		}
+		.dsh-atb-iso-commit-btn:hover { background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,.08)); }
+		.dsh-atb-iso-commit-btn code {
+		  font-family: ui-monospace, Consolas, monospace; font-size: 10.5px;
+		  color: var(--dsw-alias-state-business-primary, #3e63dd); flex-shrink: 0;
+		}
+		.dsh-atb-iso-commit-btn span { word-break: break-all; color: var(--dsw-alias-label-secondary, inherit); }
+		.dsh-atb-iso-commit[data-open="true"] > .dsh-atb-iso-commit-btn code { font-weight: 700; }
+		.dsh-atb-iso-dirty { display: flex; flex-direction: column; gap: 6px;
+		  font-size: 11.5px; color: var(--dsw-alias-state-error-primary, #e5484d);
+		  background: rgba(229,72,77,.09); border: 1px solid rgba(229,72,77,.35);
+		  border-radius: 8px; padding: 6px 10px; margin-bottom: 8px;
+		}
+		.dsh-atb-iso-dirty-toggle { border: none; background: none; cursor: pointer; padding: 0; text-align: left; color: inherit; font-size: inherit; }
+		.dsh-atb-iso-dirty-files { display: flex; flex-direction: column; gap: 2px; }
+		.dsh-atb-iso-dirty-file {
+		  border: none; background: none; cursor: pointer; text-align: left; padding: 1px 2px;
+		  font-size: 11px; color: var(--dsw-alias-label-secondary, inherit); border-radius: 4px; word-break: break-all;
+		}
+		.dsh-atb-iso-dirty-file:hover { background: rgba(128,128,128,.1); color: var(--dsw-alias-state-business-primary, #3e63dd); }
+		.dsh-atb-iso-dirty-file code { font-family: ui-monospace, Consolas, monospace; font-size: 10px; margin-right: 6px; }
+		.dsh-atb-diffview { margin-top: 6px; border-radius: 8px; overflow: hidden;
+		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.25)); }
+		.dsh-atb-diffview-head { display: flex; align-items: center; gap: 10px; padding: 5px 10px;
+		  background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,.08)); }
+		.dsh-atb-diffview-title { font-family: ui-monospace, Consolas, monospace; font-size: 10.5px;
+		  color: var(--dsw-alias-state-business-primary, #3e63dd); word-break: break-all; }
+		.dsh-atb-diffview-hint { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); }
+		.dsh-atb-diffview-error { padding: 8px 10px; font-size: 11.5px; color: var(--dsw-alias-state-error-primary, #e5484d); }
+		.dsh-atb-diffview-pre {
+		  margin: 0; padding: 8px 10px; max-height: 340px; overflow: auto;
+		  font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; line-height: 1.5;
+		  white-space: pre; color: var(--dsw-alias-label-secondary, inherit);
+		}
+
+		/* ---------- 0.4.0 new-task menu + template manager + import ---------- */
+		.dsh-atb-newmenu { position: relative; display: inline-flex; }
+		.dsh-atb-newmenu-backdrop { position: fixed; inset: 0; z-index: 40; }
+		.dsh-atb-newmenu-list {
+		  position: absolute; top: calc(100% + 4px); left: 0; z-index: 41; min-width: 180px;
+		  display: flex; flex-direction: column; padding: 5px; border-radius: 10px;
+		  background: var(--dsw-alias-bg-overlay, #fff); color: var(--dsw-alias-label-primary, inherit);
+		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.25));
+		  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0,0,0,.18));
+		}
+		.dsh-atb-newmenu-opt {
+		  border: none; background: none; text-align: left; cursor: pointer; padding: 7px 10px;
+		  font-size: 12.5px; color: inherit; border-radius: 7px; white-space: nowrap;
+		}
+		.dsh-atb-newmenu-opt:hover { background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,.1)); }
+		.dsh-atb-newmenu-sep { height: 1px; margin: 4px 6px; background: var(--dsw-alias-border-l2, rgba(128,128,128,.25)); }
+
+		.dsh-atb-tplm { max-width: 560px; width: min(560px, 92vw); }
+		.dsh-atb-tplm-list { display: flex; flex-direction: column; gap: 8px; }
+		.dsh-atb-tplm-row {
+		  display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px;
+		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.25));
+		}
+		.dsh-atb-tplm-name {
+		  flex: 0 0 160px; font-size: 12.5px; padding: 5px 8px; border-radius: 7px;
+		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.3));
+		  background: var(--dsw-alias-bg-layer-1, transparent); color: inherit;
+		}
+		.dsh-atb-tplm-meta { flex: 1; min-width: 0; font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); }
+		.dsh-atb-tplm-btns { display: flex; gap: 6px; flex-shrink: 0; }
+
+		.dsh-atb-imp { max-width: 600px; width: min(600px, 92vw); }
+		.dsh-atb-imp-picker { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+		.dsh-atb-imp-picker input[type="file"] { font-size: 12px; }
+		.dsh-atb-imp-filename { font-size: 11.5px; color: var(--dsw-alias-state-business-primary, #3e63dd); word-break: break-all; }
+		.dsh-atb-imp-note { font-size: 11px; color: var(--dsw-alias-label-tertiary, gray); margin-bottom: 10px; }
+		.dsh-atb-imp-error { font-size: 12px; color: var(--dsw-alias-state-error-primary, #e5484d); margin-bottom: 8px; }
+		.dsh-atb-imp-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+		.dsh-atb-imp-stat {
+		  display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 9px 6px; border-radius: 9px;
+		  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.25));
+		}
+		.dsh-atb-imp-stat b { font-size: 17px; font-weight: 700; }
+		.dsh-atb-imp-stat span { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); }
+		.dsh-atb-imp-stat[data-tone="ok"] b { color: var(--dsw-alias-state-success-primary, #30a46c); }
+		.dsh-atb-imp-stat[data-tone="warn"] b { color: var(--dsw-alias-state-warn-primary, #f5a524); }
+		.dsh-atb-imp-stat[data-tone="bad"] b { color: var(--dsw-alias-state-error-primary, #e5484d); }
+		.dsh-atb-imp-sec h4 { margin: 0 0 6px; font-size: 12px; }
+		.dsh-atb-imp-sec { margin-bottom: 10px; }
+		.dsh-atb-imp-list { display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
+		.dsh-atb-imp-row {
+		  display: flex; align-items: center; gap: 10px; justify-content: space-between;
+		  padding: 5px 9px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.2));
+		}
+		.dsh-atb-imp-row[data-tone="bad"] { border-color: rgba(229,72,77,.35); }
+		.dsh-atb-imp-row-title { font-size: 12px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.dsh-atb-imp-row-status { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); flex-shrink: 0; }
+		.dsh-atb-imp-result { font-size: 12px; color: var(--dsw-alias-state-success-primary, #30a46c); margin-top: 10px; }
+		.dsh-atb-badge[data-kind="checklist"] { color: var(--dsw-alias-label-secondary, inherit); }
 		`;
 		let injected = false;
 		/** Inject the stylesheet once (idempotent). */
@@ -1263,6 +1608,8 @@ window.__ModuleLoader__.load({
 
 		//#endregion
 		//#region src/client/sidebar-entry.ts
+		/** Stable data attribute identifying this entry row. */
+		const ENTRY_SELECTOR = "[data-dsh-atb-entry]";
 		/** Inline icon (16px nav-icon look). */
 		const ICON = "<svg viewBox=\"0 0 16 16\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.3\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"11\" rx=\"1.5\"/><path d=\"M2 6.5h12M6.5 6.5v7\"/></svg>";
 		/**
@@ -1277,15 +1624,18 @@ window.__ModuleLoader__.load({
 		/**
 		* The New Session button: nested in the logo row on current shells, a direct
 		* child BUTTON on the real shell (the family plugins' fallback), with
-		* aria-label/text fallbacks for other shells.
+		* aria-label/text fallbacks for other shells. The direct-child scan skips
+		* our own entry (0.4.1): on shells where the insertion anchor lands inside a
+		* class-carrying container, a self-referential anchor would pin the entry
+		* against that container's own geometry instead of the family block.
 		*/
 		function newSessionButton(root) {
 			const nested = root.querySelector("button[class*=\"newSession\"]");
 			if (nested !== null) return nested;
-			for (const child of root.children) if (child instanceof HTMLButtonElement) return child;
+			for (const child of root.children) if (child instanceof HTMLButtonElement && !child.matches("[data-dsh-atb-entry]")) return child;
 			const byAria = root.querySelector("button[aria-label=\"新建会话\"], button[aria-label=\"New Session\"], button[aria-label*=\"新会话\"], button[aria-label*=\"new session\" i]");
 			if (byAria !== null) return byAria;
-			return Array.from(root.querySelectorAll("button")).find((button) => /新会话|新建会话|new session/i.test(button.textContent ?? ""));
+			return Array.from(root.querySelectorAll("button")).find((button) => !button.matches("[data-dsh-atb-entry]") && /新会话|新建会话|new session/i.test(button.textContent ?? ""));
 		}
 		/** Build the entry row (a detached button; insert once the shell is up). */
 		function createEntry(controller) {
@@ -1493,7 +1843,7 @@ window.__ModuleLoader__.load({
 		* @module dsh-taskboard/shared/version
 		*/
 		/** The package version (must equal package.json "version"). */
-		const PLUGIN_VERSION = "0.3.3";
+		const PLUGIN_VERSION = "0.4.4";
 
 		//#endregion
 		//#region src/client/board/TaskCard.tsx
@@ -1606,6 +1956,17 @@ window.__ModuleLoader__.load({
 							task.model !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: "dsh-atb-badge",
 								children: task.model.model
+							}),
+							task.checklist !== void 0 && task.checklist.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "dsh-atb-badge",
+								"data-kind": task.status === "in_review" && task.checklist.some((i) => !i.checked) ? "blocked" : "checklist",
+								title: task.status === "in_review" && task.checklist.some((i) => !i.checked) ? "待验收：清单未全部勾选" : "验收清单进度",
+								children: [
+									"☑ ",
+									task.checklist.filter((i) => i.checked).length,
+									"/",
+									task.checklist.length
+								]
 							}),
 							task.status === "done" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: "dsh-atb-badge",
@@ -1821,6 +2182,192 @@ window.__ModuleLoader__.load({
 		function shortHash(hash) {
 			return hash === void 0 ? "" : hash.slice(0, 8);
 		}
+		/** Truncate a long string for a chip (full value in the tooltip). */
+		function shorten(s, max = 40) {
+			return s.length > max ? `${s.slice(0, max)}…` : s;
+		}
+		/** Whether a solution ref looks like a clickable http(s) URL. */
+		function isUrl(ref) {
+			try {
+				const u = new URL(ref);
+				return u.protocol === "http:" || u.protocol === "https:";
+			} catch {
+				return false;
+			}
+		}
+		/** Extract the path from one `git status --porcelain` line (rename-aware). */
+		function porcelainPath(line) {
+			let p = line.slice(3);
+			const arrow = p.indexOf(" -> ");
+			if (arrow >= 0) p = p.slice(arrow + 4);
+			if (p.startsWith("\"") && p.endsWith("\"") && p.length > 1) p = p.slice(1, -1);
+			return p;
+		}
+		/**
+		* Lazy diff viewer (0.4.0): loads on mount, renders inside a capped <pre>.
+		* @param spec - what to show: one commit hash, or one changed path.
+		*/
+		function DiffView({ controller, task, execution, commit, path }) {
+			const [state, setState] = (0, react.useState)({ loading: true });
+			(0, react.useEffect)(() => {
+				let alive = true;
+				setState({ loading: true });
+				controller.fetchDiff(task.id, {
+					execution: execution.id,
+					...commit !== void 0 ? { commit } : { path: path ?? "" }
+				}).then((result) => {
+					if (!alive) return;
+					if (result === void 0) setState({
+						loading: false,
+						failed: true
+					});
+					else setState({
+						loading: false,
+						diff: result.diff,
+						truncated: result.truncated
+					});
+				});
+				return () => {
+					alive = false;
+				};
+			}, [
+				controller,
+				task.id,
+				execution.id,
+				commit,
+				path
+			]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-diffview",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsh-atb-diffview-head",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsh-atb-diffview-title",
+							children: commit !== void 0 ? `提交 ${shortHash(commit)}` : `文件 ${path}`
+						}),
+						state.loading && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsh-atb-diffview-hint",
+							children: "读取中…"
+						}),
+						state.truncated === true && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsh-atb-diffview-hint",
+							children: "⚠ 内容过长已截断"
+						})
+					]
+				}), state.failed === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: "dsh-atb-diffview-error",
+					children: "获取失败（原因见看板顶部错误条；对象可能已随 worktree 删除丢失）"
+				}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("pre", {
+					className: "dsh-atb-diffview-pre",
+					children: state.diff ?? ""
+				})]
+			});
+		}
+		/**
+		* The DoD checklist block (0.4.0): user-togglable items, checker + evidence
+		* per row; unchecked items highlight while the task sits in in_review.
+		*/
+		function ChecklistBlock({ task, controller }) {
+			const items = task.checklist ?? [];
+			if (items.length === 0) return null;
+			const { done, total } = checklistProgress(task);
+			const unchecked = total - done;
+			const reviewing = task.status === "in_review";
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-fieldcard",
+				"data-kind": "checklist",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsh-atb-fieldcard-label",
+					children: ["验收清单（DoD）", /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "dsh-atb-cl-progress",
+						"data-tone": reviewing && unchecked > 0 ? "bad" : void 0,
+						children: [
+							"☑ ",
+							done,
+							"/",
+							total,
+							reviewing && unchecked > 0 ? ` · ${unchecked} 项未完成` : done === total ? " · 全部完成" : ""
+						]
+					})]
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: "dsh-atb-cl-items",
+					children: items.map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: "dsh-atb-cl-item",
+						"data-checked": item.checked ? "true" : void 0,
+						"data-alert": reviewing && !item.checked ? "true" : void 0,
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								type: "checkbox",
+								checked: item.checked,
+								onChange: () => void controller.toggleChecklistItem(task, item.id)
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsh-atb-cl-text",
+								children: item.text
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "dsh-atb-cl-meta",
+								children: [item.checked ? `${item.checkedBy === "user" ? "👤 用户" : `🤖 ${shortId(item.checkedBy)}`} · ${fmtTime(item.checkedAt)}` : "未完成", item.note !== void 0 && item.note.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									className: "dsh-atb-cl-note",
+									title: item.note,
+									children: ["证据：", item.note]
+								})]
+							})
+						]
+					}, item.id))
+				})]
+			});
+		}
+		/**
+		* The structured execution report block (0.4.0): the newest execution that
+		* carries one, rendered section by section for the reviewer.
+		*/
+		function ReportBlock({ task }) {
+			const execution = [...task.executions].reverse().find((e) => e.report !== void 0);
+			const report = execution?.report;
+			if (execution === void 0 || report === void 0) return null;
+			const section = (label, rows) => rows !== void 0 && rows.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-rpt-sec",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: "dsh-atb-rpt-label",
+					children: label
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ul", {
+					className: "dsh-atb-rpt-list",
+					children: rows.map((row, i) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", { children: row }, i))
+				})]
+			}) : null;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-fieldcard",
+				"data-kind": "report",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "dsh-atb-fieldcard-label",
+						children: ["执行报告", /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "dsh-atb-cl-progress",
+							children: ["由执行会话提交 · ", fmtTime(execution.endedAt ?? execution.startedAt)]
+						})]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "dsh-atb-rpt-summary",
+						children: report.summary
+					}),
+					section("改动文件", report.changedFiles),
+					section("自验情况", report.checks),
+					section("产物", report.artifacts),
+					report.risk.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "dsh-atb-rpt-sec",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsh-atb-rpt-label",
+							children: "剩余风险"
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsh-atb-rpt-risk",
+							children: report.risk
+						})]
+					})
+				]
+			});
+		}
 		/**
 		* The 0.3.0 isolation block: branch / baseline→head commits / change stats /
 		* uncommitted-changes warning, plus the user-only git actions (merge /
@@ -1831,6 +2378,8 @@ window.__ModuleLoader__.load({
 			const [confirmMerge, setConfirmMerge] = (0, react.useState)(false);
 			const [confirmRemove, setConfirmRemove] = (0, react.useState)(null);
 			const [busy, setBusy] = (0, react.useState)(false);
+			const [openDiff, setOpenDiff] = (0, react.useState)(null);
+			const [dirtyOpen, setDirtyOpen] = (0, react.useState)(false);
 			const execution = latestIsolated(task);
 			const running = task.executions.some((e) => e.outcome === "running");
 			if (execution === void 0) return null;
@@ -1915,7 +2464,19 @@ window.__ModuleLoader__.load({
 						className: "dsh-atb-iso-commits",
 						children: [commits.slice(0, 10).map((c) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 							className: "dsh-atb-iso-commit",
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: shortHash(c.hash) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: c.subject })]
+							"data-open": openDiff?.commit === c.hash ? "true" : void 0,
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+								type: "button",
+								className: "dsh-atb-iso-commit-btn",
+								title: "点击展开该提交的 diff",
+								onClick: () => setOpenDiff(openDiff?.commit === c.hash ? null : { commit: c.hash }),
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: shortHash(c.hash) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: c.subject })]
+							}), openDiff?.commit === c.hash && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(DiffView, {
+								controller,
+								task,
+								execution,
+								commit: c.hash
+							})]
 						}, c.hash)), commitTotal > 10 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 							className: "dsh-atb-iso-more",
 							children: [
@@ -1930,11 +2491,48 @@ window.__ModuleLoader__.load({
 					}),
 					dirtyTotal > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: "dsh-atb-iso-dirty",
-						title: dirty.join("\n"),
 						children: [
-							"⚠ 有 ",
-							dirtyTotal,
-							" 处未提交修改（合并前请让 agent 提交，或手动处理）"
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+								type: "button",
+								className: "dsh-atb-iso-dirty-toggle",
+								onClick: () => setDirtyOpen(!dirtyOpen),
+								children: [
+									"⚠ 有 ",
+									dirtyTotal,
+									" 处未提交修改（合并前请让 agent 提交，或手动处理）",
+									dirtyOpen ? " ▲" : " ▼ 查看文件"
+								]
+							}),
+							dirtyOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "dsh-atb-iso-dirty-files",
+								children: [dirty.slice(0, 30).map((line, index) => {
+									const filePath = porcelainPath(line);
+									return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+										type: "button",
+										className: "dsh-atb-iso-dirty-file",
+										title: "点击查看该文件的未提交 diff",
+										onClick: () => setOpenDiff(openDiff?.path === filePath ? null : { path: filePath }),
+										children: [
+											/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: line.slice(0, 2) }),
+											" ",
+											filePath
+										]
+									}, `${line}-${index}`);
+								}), dirtyTotal > 30 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsh-atb-iso-more",
+									children: [
+										"… 共 ",
+										dirtyTotal,
+										" 处（完整列表见任务台账）"
+									]
+								})]
+							}),
+							openDiff?.path !== void 0 && dirtyOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(DiffView, {
+								controller,
+								task,
+								execution,
+								path: openDiff.path
+							})
 						]
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -2039,6 +2637,7 @@ window.__ModuleLoader__.load({
 			const runningExecution = task.executions.find((e) => e.outcome === "running");
 			const holder = task.status === "in_progress" ? task.claimedBy : void 0;
 			const stale = now !== void 0 && isStaleClaim(task, now);
+			const unchecked = (task.checklist ?? []).filter((i) => !i.checked).length;
 			/** Jump to an execution's session; prompt precisely when it cannot open. */
 			const jumpToSession = (sessionId) => {
 				controller.openSession(sessionId).then((result) => {
@@ -2083,6 +2682,26 @@ window.__ModuleLoader__.load({
 											icon: "🎛",
 											children: task.presetId
 										}),
+										task.admissionId !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Chip, {
+											icon: "🪪",
+											children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+												title: task.admissionId,
+												children: ["准入 ", shorten(task.admissionId)]
+											})
+										}),
+										task.solutionRef !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Chip, {
+											icon: "🔗",
+											children: isUrl(task.solutionRef) ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("a", {
+												href: task.solutionRef,
+												target: "_blank",
+												rel: "noreferrer",
+												title: task.solutionRef,
+												children: shorten(task.solutionRef)
+											}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												title: task.solutionRef,
+												children: shorten(task.solutionRef)
+											})
+										}),
 										task.execution.mode === "scheduled" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(Chip, {
 											icon: "⏰",
 											children: [
@@ -2095,6 +2714,16 @@ window.__ModuleLoader__.load({
 											icon: "⛔",
 											tone: "urgent",
 											children: "受阻"
+										}),
+										task.checklist !== void 0 && task.checklist.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(Chip, {
+											icon: "☑",
+											tone: task.status === "in_review" && task.checklist.some((i) => !i.checked) ? "urgent" : void 0,
+											children: [
+												"清单 ",
+												checklistProgress(task).done,
+												"/",
+												task.checklist.length
+											]
 										}),
 										task.branch !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(Chip, {
 											icon: "🌿",
@@ -2147,6 +2776,17 @@ window.__ModuleLoader__.load({
 									title: "复制此任务的全部配置为一张新卡（待办列）",
 									onClick: () => void controller.duplicate(task),
 									children: "⧉ 复制"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-detail-edit",
+									title: "把此任务的配置（含清单）保存为模板，新建任务时可用",
+									onClick: () => {
+										controller.saveAsTemplate(task).then((ok) => {
+											if (ok) showAlert("已存为模板（新建任务 ▼ 下拉可用，可在模板管理中改名）");
+										});
+									},
+									children: "⌗ 存为模板"
 								}),
 								canRun && task.branch !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 									type: "button",
@@ -2229,6 +2869,11 @@ window.__ModuleLoader__.load({
 						task,
 						controller
 					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ReportBlock, { task }),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ChecklistBlock, {
+						task,
+						controller
+					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						className: "dsh-atb-detail-actions",
 						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -2239,7 +2884,8 @@ window.__ModuleLoader__.load({
 									children: [
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											className: "dsh-atb-confirm-label",
-											children: "确认完成？"
+											"data-tone": unchecked > 0 ? "bad" : void 0,
+											children: unchecked > 0 ? `仍有 ${unchecked} 项清单未勾选，确认完成？` : "确认完成？"
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 											type: "button",
@@ -2513,28 +3159,96 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/**
-		* The form modal. Without `task` it composes a new task; with `task` it
-		* edits that record (project, urgency, execution, model included — the GUI
-		* is the owner surface).
+		* The checklist (DoD) editor: toggle + text + remove per row, add button,
+		* cap-enforced. Edit mode preserves checked state and notes (the GUI
+		* replaces the whole list on save).
+		*/
+		function ChecklistEditor({ rows, onChange, editing }) {
+			const setRow = (index, patch) => {
+				onChange(rows.map((row, i) => i === index ? {
+					...row,
+					...patch
+				} : row));
+			};
+			const checked = rows.filter((r) => r.checked).length;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-cke",
+				children: [
+					rows.map((row, index) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "dsh-atb-cke-row",
+						children: [
+							editing && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								type: "checkbox",
+								className: "dsh-atb-cke-box",
+								checked: row.checked,
+								title: `勾选状态随保存保留（当前勾选人：${row.checkedBy ?? "未勾选"}）`,
+								onChange: (e) => setRow(index, { checked: e.target.checked })
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								className: "dsh-atb-cke-text",
+								value: row.text,
+								maxLength: 200,
+								placeholder: `验收项 ${index + 1}（完成标准）`,
+								spellCheck: false,
+								onChange: (e) => setRow(index, { text: e.target.value })
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsh-atb-cke-del",
+								title: "删除该验收项",
+								onClick: () => onChange(rows.filter((_, i) => i !== index)),
+								children: "✕"
+							})
+						]
+					}, row.id ?? `new-${index}`)),
+					rows.length < 30 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						type: "button",
+						className: "dsh-atb-cke-add",
+						onClick: () => onChange([...rows, {
+							text: "",
+							checked: false
+						}]),
+						children: "＋ 添加验收项"
+					}),
+					rows.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsh-atb-cke-hint",
+						children: editing ? `已勾选 ${checked}/${rows.length}（保存将整体覆盖清单，勾选状态保留）` : `共 ${rows.length} 项，执行会话按清单干活并逐项勾选，未完成项验收时高亮`
+					})
+				]
+			});
+		}
+		/**
+		* The form modal. Without `task` it composes a new task (optionally
+		* prefilled from a chosen template); with `task` it edits that record
+		* (project, urgency, execution, model included — the GUI is the owner
+		* surface).
 		* @param controller - the controller.
 		* @param task - the task being edited (create mode when absent).
 		*/
 		function TaskFormModal({ controller, task }) {
 			const state = controller.getSnapshot();
+			const prefill = state.templatePrefill;
 			const editing = task !== void 0;
-			const [title, setTitle] = (0, react.useState)(task?.title ?? "");
-			const [description, setDescription] = (0, react.useState)(task?.description ?? "");
-			const [prompt, setPrompt] = (0, react.useState)(task?.prompt ?? "");
+			const [title, setTitle] = (0, react.useState)(task?.title ?? prefill?.title ?? "");
+			const [description, setDescription] = (0, react.useState)(task?.description ?? prefill?.description ?? "");
+			const [prompt, setPrompt] = (0, react.useState)(task?.prompt ?? prefill?.prompt ?? "");
+			const [admissionId, setAdmissionId] = (0, react.useState)(task?.admissionId ?? "");
+			const [solutionRef, setSolutionRef] = (0, react.useState)(task?.solutionRef ?? "");
 			const [workspaceId, setWorkspaceId] = (0, react.useState)(task?.workspaceId ?? state.filters.workspaceId ?? state.workspaces[0]?.id ?? "");
-			const [urgency, setUrgency] = (0, react.useState)(task?.urgency ?? "normal");
-			const [mode, setMode] = (0, react.useState)(task?.execution.mode === "scheduled" ? "scheduled" : "claim");
-			const [cron, setCron] = (0, react.useState)(task?.execution.cron ?? "0 9 * * *");
+			const [urgency, setUrgency] = (0, react.useState)(task?.urgency ?? (prefill?.urgency === "urgent" || prefill?.urgency === "relaxed" ? prefill.urgency : "normal"));
+			const [mode, setMode] = (0, react.useState)(task?.execution.mode === "scheduled" || prefill?.execution?.mode === "scheduled" ? "scheduled" : "claim");
+			const [cron, setCron] = (0, react.useState)(task?.execution.cron ?? prefill?.execution?.cron ?? "0 9 * * *");
 			const [catalog, setCatalog] = (0, react.useState)([]);
-			const [model, setModel] = (0, react.useState)(task?.model !== void 0 ? JSON.stringify(task.model) : "");
-			const [presetId, setPresetId] = (0, react.useState)(task?.presetId ?? "");
+			const [model, setModel] = (0, react.useState)(task?.model !== void 0 || prefill?.model !== void 0 ? JSON.stringify(task?.model ?? prefill?.model) : "");
+			const initialPreset = task?.presetId ?? prefill?.presetId ?? "";
+			const [presetId, setPresetId] = (0, react.useState)(initialPreset);
 			const [presets, setPresets] = (0, react.useState)([]);
 			const [presetDefault, setPresetDefault] = (0, react.useState)(void 0);
-			const [isolation, setIsolation] = (0, react.useState)(task?.isolation ?? loadDefaultIsolation());
+			const [isolation, setIsolation] = (0, react.useState)(task?.isolation ?? (prefill?.isolation === "none" ? "none" : prefill?.isolation === "worktree" ? "worktree" : loadDefaultIsolation()));
+			const [checkRows, setCheckRows] = (0, react.useState)(task?.checklist !== void 0 && task.checklist.length > 0 ? task.checklist.map((i) => ({ ...i })) : (prefill?.checklist ?? []).map((text) => ({
+				text,
+				checked: false
+			})));
 			const titleRef = (0, react.useRef)(null);
 			(0, react.useEffect)(() => {
 				titleRef.current?.focus();
@@ -2555,9 +3269,13 @@ window.__ModuleLoader__.load({
 				face().then((roster) => {
 					setPresets(roster.presets);
 					setPresetDefault(roster.defaultId);
-					if (task?.presetId === void 0 && roster.defaultId !== void 0) setPresetId(roster.defaultId);
+					if (task?.presetId === void 0 && initialPreset === "" && roster.defaultId !== void 0) setPresetId(roster.defaultId);
 				}).catch(() => setPresets([]));
-			}, [controller, task?.presetId]);
+			}, [
+				controller,
+				task?.presetId,
+				initialPreset
+			]);
 			const cronMatch = mode === "scheduled" ? parseCron(cron.trim()) : null;
 			const nextRun = cronMatch !== null ? nextCronTime(cronMatch, Date.now()) : null;
 			const cronBad = mode === "scheduled" && (cronMatch === null || nextRun === null);
@@ -2574,11 +3292,17 @@ window.__ModuleLoader__.load({
 			};
 			/** Preset payload: '' = follow the deployment default (submit omits). */
 			const presetPayload = () => presetId.trim().length > 0 ? presetId.trim() : void 0;
+			/** Checklist rows with non-empty text (blank rows are dropped on submit). */
+			const filledRows = () => checkRows.map((r) => ({
+				...r,
+				text: r.text.trim()
+			})).filter((r) => r.text.length > 0);
 			const submit = () => {
 				if (!valid) return;
 				const picked = model !== "" ? JSON.parse(model) : void 0;
 				const isolationOut = isolationPayload();
 				const presetOut = presetPayload();
+				const rows = filledRows();
 				if (editing) controller.update(task.id, task.version, {
 					title,
 					description,
@@ -2591,7 +3315,10 @@ window.__ModuleLoader__.load({
 					} : { mode },
 					model: picked ?? null,
 					...isolationOut !== void 0 && !isolationLocked ? { isolation: isolationOut } : {},
-					presetId: presetOut ?? null
+					presetId: presetOut ?? null,
+					admissionId: admissionId.trim().length > 0 ? admissionId.trim() : null,
+					solutionRef: solutionRef.trim().length > 0 ? solutionRef.trim() : null,
+					checklist: rows.length > 0 ? rows : null
 				});
 				else controller.create({
 					title,
@@ -2605,7 +3332,10 @@ window.__ModuleLoader__.load({
 					} : { mode },
 					model: picked,
 					...isolationOut !== void 0 ? { isolation: isolationOut } : {},
-					...presetOut !== void 0 ? { presetId: presetOut } : {}
+					...presetOut !== void 0 ? { presetId: presetOut } : {},
+					...admissionId.trim().length > 0 ? { admissionId: admissionId.trim() } : {},
+					...solutionRef.trim().length > 0 ? { solutionRef: solutionRef.trim() } : {},
+					...rows.length > 0 ? { checklist: rows.map((r) => r.text) } : {}
 				});
 			};
 			/** Save the form, then immediately trigger a manual run of the task. */
@@ -2614,6 +3344,7 @@ window.__ModuleLoader__.load({
 				const picked = model !== "" ? JSON.parse(model) : void 0;
 				const isolationOut = isolationPayload();
 				const presetOut = presetPayload();
+				const rows = filledRows();
 				if (editing) (async () => {
 					if (await controller.update(task.id, task.version, {
 						title,
@@ -2627,7 +3358,10 @@ window.__ModuleLoader__.load({
 						} : { mode },
 						model: picked ?? null,
 						...isolationOut !== void 0 && !isolationLocked ? { isolation: isolationOut } : {},
-						presetId: presetOut ?? null
+						presetId: presetOut ?? null,
+						admissionId: admissionId.trim().length > 0 ? admissionId.trim() : null,
+						solutionRef: solutionRef.trim().length > 0 ? solutionRef.trim() : null,
+						checklist: rows.length > 0 ? rows : null
 					})) await controller.run(task.id);
 				})();
 				else (async () => {
@@ -2643,7 +3377,10 @@ window.__ModuleLoader__.load({
 						} : { mode },
 						model: picked,
 						...isolationOut !== void 0 ? { isolation: isolationOut } : {},
-						...presetOut !== void 0 ? { presetId: presetOut } : {}
+						...presetOut !== void 0 ? { presetId: presetOut } : {},
+						...admissionId.trim().length > 0 ? { admissionId: admissionId.trim() } : {},
+						...solutionRef.trim().length > 0 ? { solutionRef: solutionRef.trim() } : {},
+						...rows.length > 0 ? { checklist: rows.map((r) => r.text) } : {}
 					});
 					if (id !== void 0) await controller.run(id);
 				})();
@@ -2779,6 +3516,26 @@ window.__ModuleLoader__.load({
 									})
 								}),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Field, {
+									label: editing ? "准入 ID" : "准入 ID（可选）",
+									full: true,
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										value: admissionId,
+										onChange: (e) => setAdmissionId(e.target.value),
+										placeholder: "任务通过准入/工单审核时的编号（选填）",
+										maxLength: 200
+									})
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Field, {
+									label: editing ? "方案链接或路径" : "方案链接或路径（可选）",
+									full: true,
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										value: solutionRef,
+										onChange: (e) => setSolutionRef(e.target.value),
+										placeholder: "参考方案的 URL 或本地文件路径，执行时发给 agent（选填）",
+										maxLength: 2e3
+									})
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Field, {
 									label: editing ? "执行 Prompt" : "执行 Prompt（可选，默认 = 标题+描述）",
 									full: true,
 									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
@@ -2882,6 +3639,15 @@ window.__ModuleLoader__.load({
 										className: "dsh-atb-isolation-note",
 										children: "当前项目非 git 仓库，将在原目录执行（任务仍按默认配置创建，运行时自动降级）"
 									})]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Field, {
+									label: editing ? "验收清单（DoD）" : "验收清单（DoD，可选）",
+									full: true,
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ChecklistEditor, {
+										rows: checkRows,
+										onChange: setCheckRows,
+										editing
+									})
 								})
 							]
 						}),
@@ -2921,6 +3687,431 @@ window.__ModuleLoader__.load({
 						})
 					]
 				})
+			});
+		}
+
+		//#endregion
+		//#region src/client/board/ImportModal.tsx
+		/**
+		* The ledger-import modal (0.4.0): pick a JSON file → dry-run preview
+		* (create / overwrite / invalid classification) → commit as merge or
+		* replace. Replace swaps the WHOLE ledger after an automatic backup and a
+		* double confirmation. Files exported by ⬇ JSON import as-is.
+		*
+		* @module dsh-taskboard/client/board/ImportModal
+		*/
+		/** One classified row (create / overwrite). */
+		function PlanRow({ row }) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-imp-row",
+				title: row.id,
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsh-atb-imp-row-title",
+					children: row.title
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsh-atb-imp-row-status",
+					children: row.status
+				})]
+			});
+		}
+		/**
+		* The import modal.
+		* @param controller - the controller.
+		*/
+		function ImportModal({ controller }) {
+			const [fileName, setFileName] = (0, react.useState)("");
+			const [parsed, setParsed] = (0, react.useState)(null);
+			const [parseError, setParseError] = (0, react.useState)(void 0);
+			const [plan, setPlan] = (0, react.useState)(void 0);
+			const [mode, setMode] = (0, react.useState)("merge");
+			const [busy, setBusy] = (0, react.useState)(false);
+			const [result, setResult] = (0, react.useState)(void 0);
+			const [confirmReplace, setConfirmReplace] = (0, react.useState)(false);
+			const fileRef = (0, react.useRef)(null);
+			const { alert: showAlert, el: alertEl } = useAlert();
+			/** Read + parse the picked file, then dry-run the preview. */
+			const onFile = (file) => {
+				setPlan(void 0);
+				setParseError(void 0);
+				setResult(void 0);
+				setConfirmReplace(false);
+				setFileName("");
+				setParsed(null);
+				if (file === void 0) return;
+				file.text().then((text) => {
+					try {
+						const value = JSON.parse(text);
+						setParsed(value);
+						setFileName(file.name);
+						controller.importPreview(value).then((p) => {
+							if (p !== void 0) setPlan(p);
+						});
+					} catch {
+						setParseError("文件不是合法 JSON");
+					}
+				});
+			};
+			/** Commit the import (replace requires the inline double confirmation). */
+			const commit = () => {
+				if (parsed === null || plan === void 0 || busy) return;
+				if (mode === "replace" && !confirmReplace) {
+					setConfirmReplace(true);
+					return;
+				}
+				setBusy(true);
+				controller.importCommit(mode, parsed).then((r) => {
+					setBusy(false);
+					setConfirmReplace(false);
+					if (r === void 0) return;
+					setResult(r.mode === "replace" ? `整册替换完成：导入 ${r.created + r.overwritten} 张（原 ${r.replacedTotal} 张已整册备份）` : `合并完成：新增 ${r.created} 张、覆盖 ${r.overwritten} 张`);
+				});
+			};
+			const close = () => controller.closeImport();
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-modal-backdrop",
+				onClick: (e) => {
+					if (e.target === e.currentTarget) close();
+				},
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsh-atb-modal dsh-atb-imp",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": "导入台账",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsh-atb-modal-head",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "dsh-atb-modal-headicon",
+									children: "⬆"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsh-atb-modal-headtext",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", { children: "导入台账" }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: "选择导出的 JSON 备份文件：先预览、再合并或整册替换" })]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-modal-close",
+									"aria-label": "关闭",
+									onClick: close,
+									children: "✕"
+								})
+							]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsh-atb-modal-body",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsh-atb-imp-picker",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										ref: fileRef,
+										type: "file",
+										accept: ".json,application/json",
+										onChange: (e) => onFile(e.target.files?.[0])
+									}), fileName.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "dsh-atb-imp-filename",
+										children: fileName
+									})]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: "dsh-atb-imp-note",
+									children: "⬇ JSON 导出的文件即为同格式备份，可直接导入恢复；导入文件的 schemaVersion 必须与当前版本一致。"
+								}),
+								parseError !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: "dsh-atb-imp-error",
+									children: parseError
+								}),
+								plan === void 0 && parseError === void 0 && fileName.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: "dsh-atb-empty2",
+									children: "预览中…"
+								}),
+								plan !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsh-atb-imp-stats",
+										children: [
+											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: "dsh-atb-imp-stat",
+												"data-tone": "ok",
+												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("b", { children: plan.create.length }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: "新增" })]
+											}),
+											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: "dsh-atb-imp-stat",
+												"data-tone": "warn",
+												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("b", { children: plan.overwrite.length }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: "覆盖（同 id）" })]
+											}),
+											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: "dsh-atb-imp-stat",
+												"data-tone": plan.invalid.length > 0 ? "bad" : void 0,
+												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("b", { children: plan.invalid.length }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: "无效（跳过）" })]
+											})
+										]
+									}),
+									plan.create.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsh-atb-imp-sec",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h4", { children: "新增任务" }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: "dsh-atb-imp-list",
+											children: plan.create.map((r) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(PlanRow, { row: r }, r.id))
+										})]
+									}),
+									plan.overwrite.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsh-atb-imp-sec",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h4", { children: "覆盖任务（整卡替换，含执行历史与评论）" }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: "dsh-atb-imp-list",
+											children: plan.overwrite.map((r) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(PlanRow, { row: r }, r.id))
+										})]
+									}),
+									plan.invalid.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsh-atb-imp-sec",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h4", { children: "无效条目（不会导入）" }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: "dsh-atb-imp-list",
+											children: plan.invalid.map((r, i) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: "dsh-atb-imp-row",
+												"data-tone": "bad",
+												title: r.id ?? "",
+												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+													className: "dsh-atb-imp-row-title",
+													children: r.id ?? "（无 id）"
+												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+													className: "dsh-atb-imp-row-status",
+													children: r.reason
+												})]
+											}, r.id ?? `invalid-${i}`))
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsh-atb-mode-picker",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+											type: "button",
+											className: "dsh-atb-mode-opt",
+											"data-on": mode === "merge",
+											onClick: () => {
+												setMode("merge");
+												setConfirmReplace(false);
+											},
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: "dsh-atb-mode-name",
+												children: "⊕ 合并"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: "dsh-atb-mode-hint",
+												children: "新增 + 按 id 覆盖，其余不动"
+											})]
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+											type: "button",
+											className: "dsh-atb-mode-opt",
+											"data-on": mode === "replace",
+											onClick: () => setMode("replace"),
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: "dsh-atb-mode-name",
+												children: "💣 整册替换"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: "dsh-atb-mode-hint",
+												children: "清空当前台账，以导入文件为准（先自动备份）"
+											})]
+										})]
+									}),
+									result !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										className: "dsh-atb-imp-result",
+										children: result
+									})
+								] })
+							]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsh-atb-modal-foot",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsh-atb-modal-hint",
+								children: mode === "replace" ? confirmReplace ? "⚠ 再次点击确认执行整册替换（不可撤销，已自动备份）" : "整册替换需要二次确认" : "合并只写入预览中列出的任务"
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "dsh-atb-modal-footbtns",
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-btn",
+									onClick: close,
+									children: result !== void 0 ? "关闭" : "取消"
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-btn",
+									"data-primary": "true",
+									"data-danger": mode === "replace" && confirmReplace ? "true" : void 0,
+									disabled: plan === void 0 || busy || result !== void 0 && false,
+									onClick: commit,
+									children: mode === "replace" && confirmReplace ? "确认整册替换" : "执行导入"
+								})]
+							})]
+						})
+					]
+				}), alertEl]
+			});
+		}
+
+		//#endregion
+		//#region src/client/board/TemplateManager.tsx
+		/**
+		* The template-manager modal (0.4.0): rename / delete / use the stored task
+		* templates. Templates live host-side (side file next to the ledger) and
+		* prefill the create form from the + 新建任务 ▼ dropdown.
+		*
+		* @module dsh-taskboard/client/board/TemplateManager
+		*/
+		/**
+		* The template manager modal.
+		* @param controller - the controller.
+		*/
+		function TemplateManager({ controller }) {
+			const state = controller.getSnapshot();
+			const [edits, setEdits] = (0, react.useState)({});
+			const [confirmId, setConfirmId] = (0, react.useState)(void 0);
+			const { alert: showAlert, el: alertEl } = useAlert();
+			const close = () => controller.closeTemplateManager();
+			const nameOf = (id, fallback) => edits[id] ?? fallback;
+			/** Save one template's rename. */
+			const save = (id, name) => {
+				const template = state.templates.find((t) => t.id === id);
+				if (template === void 0 || name === template.name) return;
+				controller.upsertTemplate({
+					id,
+					name,
+					task: template.task
+				}).then((ok) => {
+					if (ok) {
+						setEdits((prev) => {
+							const next = { ...prev };
+							delete next[id];
+							return next;
+						});
+						showAlert("模板已改名");
+					}
+				});
+			};
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsh-atb-modal-backdrop",
+				onClick: (e) => {
+					if (e.target === e.currentTarget) close();
+				},
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsh-atb-modal dsh-atb-tplm",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": "管理模板",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsh-atb-modal-head",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "dsh-atb-modal-headicon",
+									children: "⌗"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsh-atb-modal-headtext",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", { children: "任务模板" }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: "新建任务 ▼ 下拉的模板：改名 / 删除 / 直接使用；任务详情页「存为模板」可新增" })]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-modal-close",
+									"aria-label": "关闭",
+									onClick: close,
+									children: "✕"
+								})
+							]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsh-atb-modal-body",
+							children: state.templates.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "dsh-atb-empty2",
+								children: "暂无模板 — 在任务详情页点「存为模板」把常用配置沉淀下来"
+							}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "dsh-atb-tplm-list",
+								children: state.templates.map((t) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsh-atb-tplm-row",
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+											className: "dsh-atb-tplm-name",
+											value: nameOf(t.id, t.name),
+											maxLength: 60,
+											spellCheck: false,
+											"aria-label": `模板名 ${t.name}`,
+											onChange: (e) => setEdits((prev) => ({
+												...prev,
+												[t.id]: e.target.value
+											})),
+											onKeyDown: (e) => {
+												if (e.key === "Enter") save(t.id, nameOf(t.id, t.name));
+											}
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											className: "dsh-atb-tplm-meta",
+											children: [
+												t.builtin === true ? "内置" : "自建",
+												t.task.checklist !== void 0 && t.task.checklist.length > 0 ? ` · 清单 ${t.task.checklist.length} 项` : "",
+												t.task.urgency !== void 0 ? ` · ${t.task.urgency}` : ""
+											]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											className: "dsh-atb-tplm-btns",
+											children: [
+												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+													type: "button",
+													className: "dsh-atb-btn",
+													disabled: nameOf(t.id, t.name) === t.name || nameOf(t.id, t.name).trim().length === 0,
+													title: "保存改名",
+													onClick: () => save(t.id, nameOf(t.id, t.name)),
+													children: "改名"
+												}),
+												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+													type: "button",
+													className: "dsh-atb-btn",
+													title: "用此模板打开新建表单",
+													onClick: () => {
+														close();
+														controller.newFromTemplate(t.task);
+													},
+													children: "用此新建"
+												}),
+												confirmId === t.id ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+													type: "button",
+													className: "dsh-atb-btn",
+													"data-danger": "true",
+													onClick: () => {
+														controller.deleteTemplate(t.id);
+														setConfirmId(void 0);
+													},
+													children: "确认删除"
+												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+													type: "button",
+													className: "dsh-atb-btn",
+													onClick: () => setConfirmId(void 0),
+													children: "取消"
+												})] }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+													type: "button",
+													className: "dsh-atb-btn",
+													"data-danger": "true",
+													title: "删除该模板",
+													onClick: () => setConfirmId(t.id),
+													children: "🗑"
+												})
+											]
+										})
+									]
+								}, t.id))
+							})
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsh-atb-modal-foot",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsh-atb-modal-hint",
+								children: "模板随台账一同保存在 DSH 主目录，升级不丢"
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsh-atb-modal-footbtns",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-btn",
+									onClick: close,
+									children: "关闭"
+								})
+							})]
+						})
+					]
+				}), alertEl]
 			});
 		}
 
@@ -2992,6 +4183,8 @@ window.__ModuleLoader__.load({
 			const live = filterTasks(state, state.ledger.tasks.filter((t) => t.trashedAt === void 0));
 			const selected = state.selectedId === void 0 ? void 0 : state.ledger.tasks.find((t) => t.id === state.selectedId);
 			const { alert: showAlert, el: alertEl } = useAlert();
+			const [newMenuOpen, setNewMenuOpen] = (0, react.useState)(false);
+			const closeMenu = () => setNewMenuOpen(false);
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: "dsh-atb-board",
 				children: [
@@ -3028,12 +4221,55 @@ window.__ModuleLoader__.load({
 									state.ledger.revision
 								]
 							}),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-								type: "button",
-								className: "dsh-atb-btn",
-								"data-primary": "true",
-								onClick: () => controller.setComposer(true),
-								children: "+ 新建任务"
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "dsh-atb-newmenu",
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsh-atb-btn",
+									"data-primary": "true",
+									onClick: () => {
+										const next = !newMenuOpen;
+										setNewMenuOpen(next);
+										if (next) controller.prepareTemplateMenu();
+									},
+									children: "+ 新建任务 ▼"
+								}), newMenuOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: "dsh-atb-newmenu-backdrop",
+									onClick: closeMenu
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsh-atb-newmenu-list",
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: "dsh-atb-newmenu-opt",
+											onClick: () => {
+												closeMenu();
+												controller.setComposer(true);
+											},
+											children: "空白任务"
+										}),
+										state.templates.map((t) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+											type: "button",
+											className: "dsh-atb-newmenu-opt",
+											title: t.task.description !== void 0 && t.task.description.length > 0 ? t.task.description.slice(0, 120) : t.name,
+											onClick: () => {
+												closeMenu();
+												controller.newFromTemplate(t.task);
+											},
+											children: [t.name, t.builtin === true ? "" : ""]
+										}, t.id)),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", { className: "dsh-atb-newmenu-sep" }),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: "dsh-atb-newmenu-opt",
+											onClick: () => {
+												closeMenu();
+												controller.openTemplateManager();
+											},
+											children: "⌗ 管理模板…"
+										})
+									]
+								})] })]
 							}),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", { className: "dsh-atb-spacer" }),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
@@ -3106,6 +4342,13 @@ window.__ModuleLoader__.load({
 								title: "健康诊断：遗留 worktree、台账基本项",
 								onClick: () => controller.openDiagnostics(),
 								children: "⚙ 诊断"
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsh-atb-btn",
+								title: "从 JSON 备份文件导入台账（预览后合并或整册替换）",
+								onClick: () => controller.openImport(),
+								children: "⬆ 导入"
 							}),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 								type: "button",
@@ -3208,6 +4451,8 @@ window.__ModuleLoader__.load({
 						task: state.editingId === void 0 ? void 0 : state.ledger.tasks.find((t) => t.id === state.editingId)
 					}),
 					state.diagOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(DiagnosticsPanel, { controller }),
+					state.importOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ImportModal, { controller }),
+					state.tplManagerOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(TemplateManager, { controller }),
 					alertEl
 				]
 			});
@@ -3402,11 +4647,16 @@ window.__ModuleLoader__.load({
 		//#endregion
 		//#region src/client/board-mount.tsx
 		/**
-		* Board view mounting: a container appended inside the `[data-pane=
-		* "conversation"]` grid item (a trailing child React never manages), with a
-		* stylesheet rule hiding the conversation content while the board is active.
-		* Toggling rides a data attribute on <html> — no React involvement in the
-		* shell.
+		* Board view mounting: a container appended inside the center column (a
+		* trailing child React never manages), with a stylesheet rule hiding the
+		* conversation content while the board is active. Toggling rides a data
+		* attribute on <html> — no React involvement in the shell.
+		*
+		* Column matching is DUAL (0.4.2): the dev shell marks the column with
+		* `data-pane="conversation"`; the DSH Desktop shell (dsh-client-ui-layout)
+		* dropped data-pane entirely and uses CSS-Module hashed class names
+		* (`pI_x6G_centerCol`) — the class-substring fallback keeps both mounting,
+		* exactly like sidebar-entry's `[class*="sidebarCol"]` fallback.
 		*
 		* @module dsh-taskboard/client/board-mount
 		*/
@@ -3462,6 +4712,7 @@ window.__ModuleLoader__.load({
 				if (!controller.getSnapshot().boardOpen) return;
 				const target = event.target;
 				if (target === null) return;
+				if (target.closest("[data-dsh-atb-entry]") !== null) return;
 				if (target.closest(SIDEBAR_ROW_SELECTOR) !== null) controller.closeBoard();
 			};
 			document.addEventListener("click", onClickSidebarRow, true);

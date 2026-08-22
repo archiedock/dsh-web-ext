@@ -12,6 +12,8 @@ import { PLUGIN_VERSION } from '../../shared/version.ts'
 import { DRAG_TYPE, TaskCard } from './TaskCard.tsx'
 import { TaskDetail } from './TaskDetail.tsx'
 import { TaskFormModal } from './TaskFormModal.tsx'
+import { ImportModal } from './ImportModal.tsx'
+import { TemplateManager } from './TemplateManager.tsx'
 import { useAlert } from './AlertModal.tsx'
 
 /** Column labels. */
@@ -85,6 +87,9 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
   const live = filterTasks(state, state.ledger.tasks.filter(t => t.trashedAt === undefined))
   const selected = state.selectedId === undefined ? undefined : state.ledger.tasks.find(t => t.id === state.selectedId)
   const { alert: showAlert, el: alertEl } = useAlert()
+  // + 新建任务 ▼ dropdown (0.4.0): blank / templates / manage / import.
+  const [newMenuOpen, setNewMenuOpen] = useState(false)
+  const closeMenu = (): void => setNewMenuOpen(false)
 
   return (
     <div className="dsh-atb-board">
@@ -97,7 +102,7 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
             onClick={() => {
               // 官方 shell layout 服务（mobile-nav 原生按钮同一调用），
               // 由 client/index.ts 注入 layout 后暴露到 window。
-              window.__dshAtbLayoutToggle?.()
+              ;(window as unknown as { __dshAtbLayoutToggle?: () => void }).__dshAtbLayoutToggle?.()
             }}
           >
             ☰ 侧边栏
@@ -108,9 +113,41 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
         </span>
         <h2 className="dsh-atb-title">Agent 任务看板</h2>
         <span className="dsh-atb-count">{live.length} 任务 · rev {state.ledger.revision}</span>
-        <button type="button" className="dsh-atb-btn" data-primary="true" onClick={() => controller.setComposer(true)}>
-          + 新建任务
-        </button>
+        <div className="dsh-atb-newmenu">
+          <button
+            type="button"
+            className="dsh-atb-btn"
+            data-primary="true"
+            onClick={() => {
+              const next = !newMenuOpen
+              setNewMenuOpen(next)
+              if (next) controller.prepareTemplateMenu()
+            }}
+          >
+            + 新建任务 ▼
+          </button>
+          {newMenuOpen && (
+            <>
+              <div className="dsh-atb-newmenu-backdrop" onClick={closeMenu} />
+              <div className="dsh-atb-newmenu-list">
+                <button type="button" className="dsh-atb-newmenu-opt" onClick={() => { closeMenu(); controller.setComposer(true) }}>空白任务</button>
+                {state.templates.map(t => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className="dsh-atb-newmenu-opt"
+                    title={t.task.description !== undefined && t.task.description.length > 0 ? t.task.description.slice(0, 120) : t.name}
+                    onClick={() => { closeMenu(); controller.newFromTemplate(t.task) }}
+                  >
+                    {t.name}{t.builtin === true ? '' : ''}
+                  </button>
+                ))}
+                <div className="dsh-atb-newmenu-sep" />
+                <button type="button" className="dsh-atb-newmenu-opt" onClick={() => { closeMenu(); controller.openTemplateManager() }}>⌗ 管理模板…</button>
+              </div>
+            </>
+          )}
+        </div>
         <div className="dsh-atb-spacer" />
         <input
           className="dsh-atb-input dsh-atb-search"
@@ -155,6 +192,7 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
           {state.secondaryOpen ? '返回看板' : '其它任务'}
         </button>
         <button type="button" className="dsh-atb-btn" title="健康诊断：遗留 worktree、台账基本项" onClick={() => controller.openDiagnostics()}>⚙ 诊断</button>
+        <button type="button" className="dsh-atb-btn" title="从 JSON 备份文件导入台账（预览后合并或整册替换）" onClick={() => controller.openImport()}>⬆ 导入</button>
         <button type="button" className="dsh-atb-btn" title="下载完整台账备份（JSON）" onClick={() => controller.exportJson()}>⬇ JSON</button>
         <button type="button" className="dsh-atb-btn" title="下载任务清单（CSV）" onClick={() => controller.exportCsv()}>⬇ CSV</button>
         <a
@@ -239,6 +277,10 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
       )}
 
       {state.diagOpen && <DiagnosticsPanel controller={controller} />}
+
+      {state.importOpen && <ImportModal controller={controller} />}
+
+      {state.tplManagerOpen && <TemplateManager controller={controller} />}
 
       {alertEl}
     </div>

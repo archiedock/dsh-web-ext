@@ -433,7 +433,12 @@ var ExecutionService = class {
 	* @param degradeNote - why a worktree task degraded to the main directory.
 	*/
 	pluginFraming(task, prepared, degradeNote) {
-		let text = `【任务看板】${task.title}（ID: ${task.id}）\n本会话由任务看板执行服务启动，任务已置为进行中——无需认领；「已完成」仅限用户在界面操作（代码已限制，移了会被拒）。\n完成后按序交接：\n1. taskboard_get 读取本任务，取得最新 version\n2. taskboard_comment_add 留评论：做了什么改动 / 如何验证 / 剩余风险\n3. taskboard_move 将本任务移至待验收 in_review（带 ifVersion）\n若无法完成：留评论说明原因，将任务移回待办 todo。`;
+		let text = `【任务看板】${task.title}（ID: ${task.id}）\n本会话由任务看板执行服务启动，任务已置为进行中——无需认领；「已完成」仅限用户在界面操作（代码已限制，移了会被拒）。\n完成后按序交接：\n1. taskboard_get 读取本任务，取得最新 version\n2. taskboard_execution_report 提交结构化执行报告（做了什么/改了哪些文件/如何验证/剩余风险；提交与评论不冲突，都会展示给验收人）\n3. taskboard_comment_add 留评论：做了什么改动 / 如何验证 / 剩余风险\n4. taskboard_move 将本任务移至待验收 in_review（带 ifVersion）\n若无法完成：留评论说明原因，将任务移回待办 todo。`;
+		if (task.checklist !== void 0 && task.checklist.length > 0) {
+			const items = task.checklist.map((item, index) => `${item.checked ? "☑" : "☐"} ${index + 1}. ${item.text}${item.note !== void 0 ? `（证据: ${item.note}）` : ""}`).join("\n");
+			const done = task.checklist.filter((i) => i.checked).length;
+			text += `\n本任务有验收清单（DoD，${done}/${task.checklist.length} 已完成）——按清单干活：\n${items}\n完成一项就用 taskboard_checklist（action=check，附 note 证据）勾选；未完成项会在验收时高亮，全部完成再移待验收。需要补充验收项也可用 action=add 追加。`;
+		}
 		if (prepared !== void 0) if (prepared.reused === true) text += `\n本任务启用了 Git Worktree 隔离，且本次为续跑：任务工作目录是独立分支 ${prepared.branch} 的 worktree——\n${prepared.worktreePath}\n上一次执行的改动与提交都保留在原处——请先查看已有改动（git status / git log）再继续，避免重复劳动，并把新完成的工作提交到该分支。`;
 		else text += `\n本任务启用了 Git Worktree 隔离：任务工作目录是独立分支 ${prepared.branch} 的全新 worktree——\n${prepared.worktreePath}\n（全新检出，不含 node_modules/构建产物，构建或测试前可能需要先安装依赖）。\n⚠ 边界纪律：你的会话根目录是整个项目，但本任务的全部改动必须只发生在上述 worktree 目录内——命令用 workdir 指向它、文件读写用它的绝对路径；不要改动主工作区的任何其它文件；把完成的工作提交（git commit）到该分支，验收将基于该分支的提交记录合并。`;
 		else if (degradeNote !== void 0) text += `\n⚠ 本次执行未能建立隔离，正在主项目目录中工作（原因：${degradeNote}）。该目录可能有他人未提交的改动：动手前先 git status 检查现状，改动尽量集中，结束时在评论中说明动了哪些文件；避免把未经验证的改动直接提交到主分支。`;
@@ -444,13 +449,19 @@ var ExecutionService = class {
 	* prompt, else title+description) with template variables resolved from
 	* the task's own history at submit time (valuable for recurring patrols):
 	* `{{lastExecution}}` → the previous execution's trigger/outcome/error;
-	* `{{lastComments}}` → the last three comments (who + body).
+	* `{{lastComments}}` → the last three comments (who + body). When the task
+	* carries an admission id and/or a solution link-or-path (选填), a metadata
+	* block is PREPENDED so the executing agent receives the 方案 as its input.
 	*/
 	userBody(task) {
 		const lastExec = [...task.executions].reverse().find((e) => e.outcome !== "running");
 		const lastExecText = lastExec === void 0 ? "（无）" : `${lastExec.trigger} · ${lastExec.outcome}${lastExec.error !== void 0 ? ` · ${lastExec.error.slice(0, 200)}` : ""} · ${new Date(lastExec.startedAt ?? 0).toISOString()}`;
 		const lastCommentsText = task.comments.slice(-3).map((c) => `[${c.threadId !== void 0 ? "agent" : "user"}] ${c.body}`).join("\n") || "（无）";
-		return effectivePrompt(task).replace(/\{\{lastExecution\}\}/g, lastExecText).replace(/\{\{lastComments\}\}/g, lastCommentsText);
+		const meta = [];
+		if (task.admissionId !== void 0) meta.push(`准入 ID：${task.admissionId}`);
+		if (task.solutionRef !== void 0) meta.push(`本任务参考方案（链接或路径）：${task.solutionRef}`);
+		const body = effectivePrompt(task).replace(/\{\{lastExecution\}\}/g, lastExecText).replace(/\{\{lastComments\}\}/g, lastCommentsText);
+		return meta.length > 0 ? `${meta.join("\n")}\n\n${body}` : body;
 	}
 	/** Move a task back out of in_progress (and release its hold) after a failed start. */
 	async revertProgress(taskId) {

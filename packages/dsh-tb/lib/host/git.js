@@ -5,6 +5,32 @@ const QUICK_TIMEOUT_MS = 2e3;
 const HEAVY_TIMEOUT_MS = 15e3;
 /** Directory under a workspace where task worktrees live. */
 const WORKTREE_DIR = ".dsh-worktrees";
+/** Diff viewer caps (0.4.0): raw text kept per view. */
+const MAX_DIFF_BYTES = 128 * 1024;
+/** Diff viewer caps: lines kept per view. */
+const MAX_DIFF_LINES = 2e3;
+/** Cap one diff payload by bytes and lines (in order, marking truncation). */
+function capDiff(out) {
+	let text = out;
+	let truncated = false;
+	if (text.length > 131072) {
+		text = text.slice(0, MAX_DIFF_BYTES);
+		truncated = true;
+	}
+	const lines = text.split("\n");
+	if (lines.length > 2e3) {
+		text = lines.slice(0, MAX_DIFF_LINES).join("\n");
+		truncated = true;
+	}
+	return {
+		text,
+		truncated
+	};
+}
+/** A plausible git object hash (defense against option injection). */
+function isHash(hash) {
+	return /^[0-9a-f]{4,64}$/i.test(hash);
+}
 /**
 * Build the task branch name `task/<标题>+<taskId>` (plan §9 拍板).
 *
@@ -225,10 +251,77 @@ function createGitFace(exec = realExec) {
 				branch
 			], root);
 			if (!deleted.ok) throw new Error(`删除分支失败：${deleted.stderr.trim().slice(0, 300)}`);
-		})
+		}),
+		async showCommit(cwd, hash) {
+			if (!isHash(hash)) return void 0;
+			const r = await quick([
+				"show",
+				"--no-color",
+				"--format=medium",
+				hash
+			], cwd);
+			if (!r.ok || r.stdout.trim().length === 0) return void 0;
+			return capDiff(r.stdout);
+		},
+		async showPathDiff(cwd, path, baseCommit) {
+			const target = path.trim();
+			if (target.length === 0) return void 0;
+			if (baseCommit !== void 0 && isHash(baseCommit)) {
+				const r = await quick([
+					"diff",
+					"--no-color",
+					`${baseCommit}..HEAD`,
+					"--",
+					target
+				], cwd);
+				if (!r.ok) return void 0;
+				if (r.stdout.trim().length === 0) return {
+					text: "（该文件无差异）",
+					truncated: false
+				};
+				return capDiff(r.stdout);
+			}
+			const r = await quick([
+				"diff",
+				"--no-color",
+				"HEAD",
+				"--",
+				target
+			], cwd);
+			if (r.ok && r.stdout.trim().length > 0) return capDiff(r.stdout);
+			const st = await quick([
+				"status",
+				"--porcelain",
+				"--",
+				target
+			], cwd);
+			if (r.ok && st.ok && st.stdout.trim().startsWith("??")) {
+				const ni = await exec([
+					"diff",
+					"--no-color",
+					"--no-index",
+					"--",
+					"/dev/null",
+					target
+				], {
+					cwd,
+					timeout: QUICK_TIMEOUT_MS
+				});
+				if (ni.stdout.includes("diff --git")) return capDiff(ni.stdout);
+				return {
+					text: `（未跟踪新文件：${target}）`,
+					truncated: false
+				};
+			}
+			if (!r.ok) return void 0;
+			return {
+				text: "（该文件无差异）",
+				truncated: false
+			};
+		}
 	};
 }
 //#endregion
-export { WORKTREE_DIR, createGitFace, sanitizeBranchName, worktreePathOf };
+export { MAX_DIFF_BYTES, MAX_DIFF_LINES, WORKTREE_DIR, createGitFace, sanitizeBranchName, worktreePathOf };
 
 //# sourceMappingURL=git.js.map

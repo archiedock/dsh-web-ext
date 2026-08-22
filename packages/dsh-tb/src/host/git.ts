@@ -39,6 +39,39 @@ export const MAX_COMMIT_EVIDENCE = 50
 /** Evidence caps: uncommitted-change lines kept per execution record. */
 export const MAX_DIRTY_EVIDENCE = 100
 
+/** Diff viewer caps (0.4.0): raw text kept per view. */
+export const MAX_DIFF_BYTES = 128 * 1024
+
+/** Diff viewer caps: lines kept per view. */
+export const MAX_DIFF_LINES = 2_000
+
+/** One capped, read-only diff view (diff viewer, 0.4.0). */
+export interface DiffResult {
+  text: string
+  truncated: boolean
+}
+
+/** Cap one diff payload by bytes and lines (in order, marking truncation). */
+function capDiff(out: string): DiffResult {
+  let text = out
+  let truncated = false
+  if (text.length > MAX_DIFF_BYTES) {
+    text = text.slice(0, MAX_DIFF_BYTES)
+    truncated = true
+  }
+  const lines = text.split('\n')
+  if (lines.length > MAX_DIFF_LINES) {
+    text = lines.slice(0, MAX_DIFF_LINES).join('\n')
+    truncated = true
+  }
+  return { text, truncated }
+}
+
+/** A plausible git object hash (defense against option injection). */
+function isHash(hash: string): boolean {
+  return /^[0-9a-f]{4,64}$/i.test(hash)
+}
+
 /** Result of one underlying exec: `ok` is exit-0, output never null. */
 export interface ExecResult { ok: boolean; stdout: string; stderr: string }
 
@@ -94,6 +127,18 @@ export interface GitFace {
   removeWorktree(root: string, worktreePath: string): Promise<void>
   /** Delete a branch; THROWS (e.g. still checked out in a worktree). */
   deleteBranch(root: string, branch: string): Promise<void>
+  /**
+   * Show one commit (message + patch) — diff viewer (0.4.0). Fail-soft:
+   * undefined on any git failure; the payload is capped.
+   */
+  showCommit(cwd: string, hash: string): Promise<DiffResult | undefined>
+  /**
+   * Show the diff of one path — diff viewer (0.4.0). Without `baseCommit`:
+   * the working-tree view (staged + unstaged vs HEAD, e.g. uncommitted
+   * changes in a live worktree); with `baseCommit`: the range
+   * base..HEAD restricted to the path. Fail-soft: undefined on failure.
+   */
+  showPathDiff(cwd: string, path: string, baseCommit?: string): Promise<DiffResult | undefined>
 }
 
 /**
@@ -289,5 +334,37 @@ export function createGitFace(exec: ExecFn = realExec): GitFace {
       const deleted = await heavy(['branch', '-D', branch], root)
       if (!deleted.ok) throw new Error(`删除分支失败：${deleted.stderr.trim().slice(0, 300)}`)
     }),
+
+    async showCommit(cwd, hash) {
+      if (!isHash(hash)) return undefined
+      const r = await quick(['show', '--no-color', '--format=medium', hash], cwd)
+      if (!r.ok || r.stdout.trim().length === 0) return undefined
+      return capDiff(r.stdout)
+    },
+
+    async showPathDiff(cwd, path, baseCommit) {
+      const target = path.trim()
+      if (target.length === 0) return undefined
+      if (baseCommit !== undefined && isHash(baseCommit)) {
+        const r = await quick(['diff', '--no-color', `${baseCommit}..HEAD`, '--', target], cwd)
+        if (!r.ok) return undefined
+        if (r.stdout.trim().length === 0) return { text: '（该文件无差异）', truncated: false }
+        return capDiff(r.stdout)
+      }
+      // Working-tree view: staged + unstaged vs HEAD.
+      const r = await quick(['diff', '--no-color', 'HEAD', '--', target], cwd)
+      if (r.ok && r.stdout.trim().length > 0) return capDiff(r.stdout)
+      // Untracked files never appear in `git diff` — detect one and synthesize
+      // its new-file patch via --no-index (which exits 1 on differences, so
+      // its stdout is trusted whenever it carries a diff header).
+      const st = await quick(['status', '--porcelain', '--', target], cwd)
+      if (r.ok && st.ok && st.stdout.trim().startsWith('??')) {
+        const ni = await exec(['diff', '--no-color', '--no-index', '--', '/dev/null', target], { cwd, timeout: QUICK_TIMEOUT_MS })
+        if (ni.stdout.includes('diff --git')) return capDiff(ni.stdout)
+        return { text: `（未跟踪新文件：${target}）`, truncated: false }
+      }
+      if (!r.ok) return undefined
+      return { text: '（该文件无差异）', truncated: false }
+    },
   }
 }
